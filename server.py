@@ -1200,6 +1200,8 @@ class TokenUsageHandler(BaseHTTPRequestHandler):
                 content_type = "text/css; charset=utf-8"
             elif name.endswith(".js"):
                 content_type = "application/javascript; charset=utf-8"
+            elif name.endswith(".svg"):
+                content_type = "image/svg+xml"
             return self.serve_static(name, content_type)
         if route == "/api/dashboard":
             return json_response(self, build_dashboard())
