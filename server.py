@@ -1193,6 +1193,8 @@ class TokenUsageHandler(BaseHTTPRequestHandler):
         route = parsed.path
         if route == "/":
             return self.serve_static("index.html", "text/html; charset=utf-8")
+        if route == "/favicon.ico":
+            return self.serve_static("favicon.svg", "image/svg+xml")
         if route.startswith("/static/"):
             name = route[len("/static/") :]
             content_type = "text/plain; charset=utf-8"
