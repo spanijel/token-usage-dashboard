@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Usage Observatory</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <div class="backdrop"></div>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">Codex Usage Observatory</p>
+        <h1>A detailed report over Codex usage across your local machine and reachable SSH hosts.</h1>
+        <p class="lede">
+          This view is driven from the newest local Codex SQLite database and any configured remote hosts
+          reachable over SSH. It surfaces local detail, fleet-wide totals, cadence, concentration, workspace
+          spread, model mix, and the heaviest threads without pretending to know data that is not present.
+        </p>
+        <div class="hero-strip" id="coverage-strip"></div>
+      </section>
+
+      <section class="dashboard-grid">
+        <article class="panel summary-panel">
+          <div class="card-head">
+            <div>
+              <p class="kicker">Automated</p>
+              <h2>Fleet Overview</h2>
+            </div>
+            <button class="ghost" id="refresh-dashboard" type="button" aria-live="polite">Refresh</button>
+          </div>
+          <div id="summary-metrics" class="metrics metrics-wide"></div>
+          <div class="viz-grid">
+            <section class="viz-panel">
+              <h3>Monthly Tokens Across Machines</h3>
+              <p class="section-note">Last eight months, aggregated across every reachable Codex machine.</p>
+              <div id="monthly-bars" class="mini-bars wide-bars"></div>
+            </section>
+            <section class="viz-panel">
+              <h3>Machine Token Comparison</h3>
+              <p class="section-note">Per-machine totals with live, cached, or unreachable state visible on the chart.</p>
+              <div id="machine-bars" class="mini-bars wide-bars"></div>
+            </section>
+          </div>
+          <div id="highlights" class="callout-list"></div>
+          <div id="summary-details" class="details"></div>
+        </article>
+
+        <article class="panel panel-span-2">
+          <h2 class="section-title">Monthly Tokens Per Machine</h2>
+          <p class="section-note">Each machine keeps the same Y-axis ceiling so month-to-month volume is directly comparable.</p>
+          <div id="machine-monthly-grid" class="machine-monthly-grid"></div>
+        </article>
+
+        <article class="panel">
+          <div class="card-head compact-head">
+            <div>
+              <p class="kicker">Official Default</p>
+              <h2>Cost Model and Override</h2>
+            </div>
+          </div>
+          <div id="cost-overview" class="details"></div>
+          <form class="pricing-form" id="pricing-form">
+            <label>
+              Pricing label
+              <input name="pricingLabel" type="text" placeholder="Example: blended OpenAI API rate" />
+            </label>
+            <label>
+              USD per block
+              <input name="usdPerBlock" type="text" placeholder="Example: 1.25" />
+            </label>
+            <label>
+              Units per block
+              <input name="unitsPerBlock" type="text" placeholder="Example: 1000000 for tokens" />
+            </label>
+            <label>
+              Flat monthly USD
+              <input name="monthlyFlatUsd" type="text" placeholder="Optional subscription cost" />
+            </label>
+            <div class="form-actions">
+              <button type="submit">Save Pricing</button>
+              <button type="button" class="ghost" id="clear-pricing">Clear Pricing</button>
+            </div>
+          </form>
+        </article>
+
+        <article class="panel">
+          <div class="card-head compact-head">
+            <div>
+              <p class="kicker">Aggregated</p>
+              <h2>Fleet Totals</h2>
+            </div>
+          </div>
+          <div id="fleet-metrics" class="metrics"></div>
+          <div id="fleet-details" class="details"></div>
+        </article>
+
+        <article class="panel panel-span-2">
+          <h2 class="section-title">Machines</h2>
+          <div id="remote-machine-list" class="row-list"></div>
+        </article>
+
+        <article class="panel">
+          <h2 class="section-title">Top Workspaces Across Machines</h2>
+          <div id="workspace-list" class="row-list"></div>
+        </article>
+
+        <article class="panel">
+          <h2 class="section-title">Models Across Machines</h2>
+          <div id="model-list" class="row-list"></div>
+        </article>
+
+        <article class="panel">
+          <h2 class="section-title">Reasoning Effort, Local Machine Only</h2>
+          <div id="effort-list" class="row-list"></div>
+        </article>
+
+        <article class="panel">
+          <h2 class="section-title">Entry Points, Local Machine Only</h2>
+          <div id="entry-list" class="row-list"></div>
+        </article>
+
+        <article class="panel panel-span-2">
+          <h2 class="section-title">Heaviest Threads, Local Machine Only</h2>
+          <div id="top-thread-list" class="row-list"></div>
+        </article>
+
+        <article class="panel panel-span-2">
+          <h2 class="section-title">Recent Activity, Local Machine Only</h2>
+          <div id="recent-thread-list" class="row-list"></div>
+        </article>
+
+        <article class="panel panel-span-2">
+          <h2 class="section-title">Environment and Guardrails, Local Machine Only</h2>
+          <div id="environment-list" class="row-list"></div>
+        </article>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

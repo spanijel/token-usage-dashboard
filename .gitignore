@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Runtime/generated dashboard data.
+data/*.json
+!data/.gitkeep
+
+# Local logs.
+*.log

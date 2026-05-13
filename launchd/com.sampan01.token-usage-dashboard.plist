@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.sampan01.token-usage-dashboard</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/sampan01/token-usage-dashboard/server.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/sampan01/token-usage-dashboard</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TOKEN_USAGE_DASHBOARD_HOST</key>
+    <string>127.0.0.1</string>
+    <key>TOKEN_USAGE_DASHBOARD_PORT</key>
+    <string>8765</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/token-usage-dashboard.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/token-usage-dashboard.err.log</string>
+</dict>
+</plist>
