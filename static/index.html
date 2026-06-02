@@ -138,6 +138,33 @@
       </section>
     </main>
 
+    <button
+      id="scroll-top-button"
+      class="scroll-top-button"
+      type="button"
+      aria-label="Back to top"
+      aria-hidden="true"
+      title="Back to top"
+    >
+      <span aria-hidden="true">↑</span>
+    </button>
+
+    <div id="month-drawer-backdrop" class="drawer-backdrop" hidden></div>
+    <aside id="month-drawer" class="month-drawer" aria-hidden="true" aria-labelledby="month-drawer-title">
+      <div class="drawer-head">
+        <div>
+          <p class="kicker">Daily Breakdown</p>
+          <h2 id="month-drawer-title">Monthly Details</h2>
+          <p id="month-drawer-meta" class="section-note"></p>
+        </div>
+        <button class="ghost" id="month-drawer-close" type="button">Close</button>
+      </div>
+      <div id="month-drawer-metrics" class="metrics"></div>
+      <div id="month-daily-bars" class="mini-bars"></div>
+      <h3 id="month-machine-list-title">Machines</h3>
+      <div id="month-machine-list" class="row-list"></div>
+    </aside>
+
     <script src="/static/app.js"></script>
   </body>
 </html>

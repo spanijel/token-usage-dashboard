@@ -3,6 +3,12 @@
 Local web app for analyzing Codex usage from the newest SQLite database in `~/.codex/state_*.sqlite`
 and from configured remote machines over SSH.
 
+Canonical Git repo:
+
+```text
+git@gitlab.geo.arm.com:gpu/shared/token-usage-dashboard.git
+```
+
 ## What it shows
 
 - Total tokens, last 30 days, last 7 days, thread count

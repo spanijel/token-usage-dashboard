@@ -8,7 +8,7 @@ over SSH.
 
 ```bash
 cd ~
-git clone git@gitlab.gpu.arm.com:Samuel.Panijel/token-usage-dashboard.git
+git clone git@gitlab.geo.arm.com:gpu/shared/token-usage-dashboard.git
 cd ~/token-usage-dashboard
 python3 server.py
 ```

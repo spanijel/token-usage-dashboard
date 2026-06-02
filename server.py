@@ -4,6 +4,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
@@ -229,9 +230,7 @@ def run_remote_codex_snapshot(host_config):
                 "-o",
                 "ConnectTimeout=8",
                 host,
-                "python3",
-                "-c",
-                remote_query_script(),
+                f"python3 -c {shlex.quote(remote_query_script())}",
             ],
             check=True,
             capture_output=True,
@@ -252,6 +251,7 @@ def run_remote_codex_snapshot(host_config):
             "first_seen_local": format_local_timestamp(totals.get("first_seen")),
             "last_seen_local": format_local_timestamp(totals.get("last_seen")),
             "monthly": payload.get("monthly", []),
+            "daily": payload.get("daily", []),
             "models": payload.get("models", []),
             "cwds": payload.get("cwds", []),
             "fetched_at": utc_now(),
@@ -278,6 +278,7 @@ def run_remote_codex_snapshot(host_config):
             "tokens_30d": None,
             "tokens_7d": None,
             "monthly": [],
+            "daily": [],
             "models": [],
             "cwds": [],
         }
@@ -321,6 +322,15 @@ GROUP BY month
 ORDER BY month DESC
 LIMIT 12
 """).fetchall()]
+daily = [dict(r) for r in cur.execute("""
+SELECT
+  strftime('%Y-%m-%d', updated_at, 'unixepoch', 'localtime') AS day,
+  COUNT(*) AS thread_count,
+  SUM(tokens_used) AS value
+FROM threads
+GROUP BY day
+ORDER BY day ASC
+""").fetchall()]
 models = [dict(r) for r in cur.execute("""
 SELECT
   COALESCE(model, '(unknown)') AS model,
@@ -346,6 +356,7 @@ print(json.dumps({
   "db_path": db_path,
   "totals": totals,
   "monthly": monthly,
+  "daily": daily,
   "models": models,
   "cwds": cwds,
 }))
@@ -354,6 +365,10 @@ print(json.dumps({
 
 def month_key(row):
     return row["month"]
+
+
+def day_key(row):
+    return row["day"]
 
 
 def aggregate_monthly_series(series_list, key_name="month", value_name="value"):
@@ -365,6 +380,17 @@ def aggregate_monthly_series(series_list, key_name="month", value_name="value"):
             bucket["value"] += row.get(value_name, 0) or 0
             bucket["thread_count"] += row.get("thread_count", 0) or 0
     return sorted(merged.values(), key=month_key, reverse=True)
+
+
+def aggregate_daily_series(series_list, key_name="day", value_name="value"):
+    merged = {}
+    for rows in series_list:
+        for row in rows or []:
+            key = row[key_name]
+            bucket = merged.setdefault(key, {"day": key, "value": 0, "thread_count": 0})
+            bucket["value"] += row.get(value_name, 0) or 0
+            bucket["thread_count"] += row.get("thread_count", 0) or 0
+    return sorted(merged.values(), key=day_key)
 
 
 def aggregate_named_rows(rows, label_key: str):
@@ -751,6 +777,7 @@ def load_codex_source():
             "unit": "tokens",
             "notes": "No ~/.codex/state_*.sqlite database was found.",
             "monthly": [],
+            "daily": [],
             "daily_30": [],
             "model_breakdown": [],
             "effort_breakdown": [],
@@ -796,6 +823,19 @@ def load_codex_source():
         FROM threads
         GROUP BY month
         ORDER BY month DESC
+        """,
+    )
+
+    daily = fetch_all_dicts(
+        cursor,
+        """
+        SELECT
+          strftime('%Y-%m-%d', updated_at, 'unixepoch', 'localtime') AS day,
+          COUNT(*) AS thread_count,
+          SUM(tokens_used) AS value
+        FROM threads
+        GROUP BY day
+        ORDER BY day ASC
         """,
     )
 
@@ -1056,6 +1096,7 @@ def load_codex_source():
         "last_seen_local": format_local_timestamp(totals["last_seen"]),
         "stats": stats,
         "monthly": monthly,
+        "daily": daily,
         "daily_30": daily_30,
         "model_breakdown": model_breakdown,
         "effort_breakdown": effort_breakdown,
@@ -1092,6 +1133,7 @@ def build_dashboard():
     combined_30d = codex.get("last_30_days", 0) + sum(source.get("tokens_30d", 0) or 0 for source in active_remote_sources)
     combined_7d = codex.get("last_7_days", 0) + sum(source.get("tokens_7d", 0) or 0 for source in active_remote_sources)
     combined_monthly = aggregate_monthly_series([codex.get("monthly", [])] + [source.get("monthly", []) for source in active_remote_sources])
+    combined_daily = aggregate_daily_series([codex.get("daily", [])] + [source.get("daily", []) for source in active_remote_sources])
     aggregate_models = aggregate_named_rows(
         list(codex.get("model_breakdown", []))
         + [
@@ -1139,6 +1181,7 @@ def build_dashboard():
             "tokens_30d": codex.get("last_30_days", 0),
             "tokens_7d": codex.get("last_7_days", 0),
             "monthly": codex.get("monthly", []),
+            "daily": codex.get("daily", []),
         }
     ] + [
         {
@@ -1150,6 +1193,7 @@ def build_dashboard():
             "tokens_30d": source.get("tokens_30d"),
             "tokens_7d": source.get("tokens_7d"),
             "monthly": source.get("monthly", []),
+            "daily": source.get("daily", []),
             "cache_notice": source.get("cache_notice"),
             "error": source.get("error"),
         }
@@ -1164,6 +1208,7 @@ def build_dashboard():
         "combined_30d_tokens": combined_30d,
         "combined_7d_tokens": combined_7d,
         "combined_monthly": combined_monthly,
+        "combined_daily": combined_daily,
         "cost": build_cost_summary(combined_total_tokens, combined_monthly, pricing),
         "models": aggregate_models,
         "workspaces": aggregate_workspaces,

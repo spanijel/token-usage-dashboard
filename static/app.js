@@ -1,7 +1,19 @@
 const coverageStrip = document.getElementById("coverage-strip");
 const refreshButton = document.getElementById("refresh-dashboard");
 const pricingForm = document.getElementById("pricing-form");
+const monthlyBars = document.getElementById("monthly-bars");
+const machineMonthlyGrid = document.getElementById("machine-monthly-grid");
+const monthDrawer = document.getElementById("month-drawer");
+const monthDrawerBackdrop = document.getElementById("month-drawer-backdrop");
+const monthDrawerClose = document.getElementById("month-drawer-close");
+const monthDailyBars = document.getElementById("month-daily-bars");
+const scrollTopButton = document.getElementById("scroll-top-button");
 const refreshButtonDefaultLabel = refreshButton ? refreshButton.textContent : "Refresh";
+let dashboardPayload = null;
+let activeDrawerMonth = null;
+let activeDrawerDay = null;
+let activeDrawerMachineHost = null;
+let scrollTopUpdatePending = false;
 
 function formatNumber(value, digits = 0) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) {
@@ -64,6 +76,13 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
+function renderDataAttributes(attributes) {
+  return Object.entries(attributes || {})
+    .filter(([name, value]) => /^[a-zA-Z0-9_-]+$/.test(name) && value !== null && value !== undefined)
+    .map(([name, value]) => `data-${name}="${escapeHtml(value)}"`)
+    .join(" ");
+}
+
 function normaliseBarLabel(label, key) {
   let text = String(label ?? "");
   if (key === "day" && /^\d{4}-\d{2}-\d{2}$/.test(text)) {
@@ -77,6 +96,30 @@ function normaliseBarLabel(label, key) {
     });
   }
   return text;
+}
+
+function formatMonthName(month) {
+  if (!/^\d{4}-\d{2}$/.test(String(month))) {
+    return String(month || "Month");
+  }
+  const [year, monthNumber] = String(month).split("-");
+  return new Date(Number(year), Number(monthNumber) - 1, 1).toLocaleDateString(undefined, {
+    month: "long",
+    year: "numeric",
+  });
+}
+
+function formatDayName(day) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(day))) {
+    return String(day || "Day");
+  }
+  const [year, month, dayOfMonth] = String(day).split("-");
+  return new Date(Number(year), Number(month) - 1, Number(dayOfMonth)).toLocaleDateString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
 }
 
 function niceStep(rawValue) {
@@ -240,6 +283,8 @@ function renderAxisChart(rows, options) {
     metaFormatter,
     statusClass,
     tooltipFormatter,
+    barDataAttrs,
+    barActionLabel,
   } = options;
   if (!rows || rows.length === 0) {
     return `<div class="empty-state">${emptyText}</div>`;
@@ -284,14 +329,26 @@ function renderAxisChart(rows, options) {
               const tooltip = tooltipFormatter
                 ? tooltipFormatter(row)
                 : `${row[labelKey]}: ${formatTokens(value)}`;
-              return `
-                <div class="chart-bar-card">
+              const actionLabel = barActionLabel ? barActionLabel(row) : "";
+              const dataAttrs = barDataAttrs ? renderDataAttributes(barDataAttrs(row)) : "";
+              const cardBody = `
                   <div class="chart-value">${formatCompactNumber(value)}</div>
                   <div class="chart-column" style="height:${height}px">
                     <div class="chart-bar ${toneClass}" style="height:${Math.max(ratio * 100, value > 0 ? 6 : 2)}%" title="${escapeHtml(tooltip)}"></div>
                   </div>
                   <div class="chart-label">${escapeHtml(label)}</div>
                   ${meta ? `<div class="chart-meta">${escapeHtml(meta)}</div>` : ""}
+              `;
+              if (actionLabel) {
+                return `
+                  <button class="chart-bar-card chart-bar-button" type="button" ${dataAttrs} aria-label="${escapeHtml(actionLabel)}">
+                    ${cardBody}
+                  </button>
+                `;
+              }
+              return `
+                <div class="chart-bar-card" ${dataAttrs}>
+                  ${cardBody}
                 </div>
               `;
             })
@@ -364,12 +421,266 @@ function renderMachineMonthlyGrid(payload) {
               },
               tooltipFormatter: (row) =>
                 `${machine.label} · ${row.month}: ${formatTokens(row.value)} tokens`,
+              barDataAttrs: (row) => ({
+                "month-drawer-month": row.month,
+                "month-drawer-machine": machine.host,
+              }),
+              barActionLabel: (row) =>
+                `Open daily usage for ${machine.label} in ${formatMonthName(row.month)}`,
             })}
           </section>
         `;
       })
       .join("")
   );
+}
+
+function sumRows(rows, key = "value") {
+  return (rows || []).reduce((total, row) => total + Number(row[key] || 0), 0);
+}
+
+function dailyRowsForMonth(rows, month) {
+  return [...(rows || [])]
+    .filter((row) => String(row.day || "").startsWith(`${month}-`))
+    .sort((left, right) => String(left.day).localeCompare(String(right.day)));
+}
+
+function filledDailyRowsForMonth(rows, month) {
+  if (!/^\d{4}-\d{2}$/.test(String(month))) {
+    return dailyRowsForMonth(rows, month);
+  }
+  const [year, monthNumber] = String(month).split("-").map((part) => Number(part));
+  const daysInMonth = new Date(year, monthNumber, 0).getDate();
+  const byDay = new Map(dailyRowsForMonth(rows, month).map((row) => [row.day, row]));
+  return Array.from({ length: daysInMonth }, (_, index) => {
+    const day = `${month}-${String(index + 1).padStart(2, "0")}`;
+    const existing = byDay.get(day);
+    return {
+      day,
+      value: existing ? Number(existing.value || 0) : 0,
+      thread_count: existing ? Number(existing.thread_count || 0) : 0,
+    };
+  });
+}
+
+function defaultDayForMonth(rows) {
+  const activeRows = (rows || []).filter(
+    (row) => Number(row.value || 0) > 0 || Number(row.thread_count || 0) > 0
+  );
+  const candidates = activeRows.length ? activeRows : rows || [];
+  if (!candidates.length) {
+    return null;
+  }
+  return [...candidates].sort((left, right) => {
+    const valueDelta = Number(right.value || 0) - Number(left.value || 0);
+    if (valueDelta !== 0) {
+      return valueDelta;
+    }
+    return String(right.day).localeCompare(String(left.day));
+  })[0].day;
+}
+
+function machineStatusText(machine) {
+  if (machine.host === "local") {
+    return "local DB";
+  }
+  if (machine.status === "cached") {
+    return "cached snapshot";
+  }
+  if (machine.status === "error") {
+    return "unreachable";
+  }
+  return "live over SSH";
+}
+
+function findMachineByHost(host) {
+  if (!host) {
+    return null;
+  }
+  return (dashboardPayload?.fleet?.machines || []).find((machine) => machine.host === host) || null;
+}
+
+function machineDisplayName(machine) {
+  if (!machine) {
+    return "Fleet";
+  }
+  if (!machine.host || machine.host === "local") {
+    return machine.label;
+  }
+  return `${machine.label} (${machine.host})`;
+}
+
+function renderMonthDrawer(month) {
+  if (!dashboardPayload || !monthDrawer) {
+    return;
+  }
+
+  const scopedMachine = findMachineByHost(activeDrawerMachineHost);
+  const scopeLabel = machineDisplayName(scopedMachine);
+  const monthlyRows = scopedMachine ? scopedMachine.monthly || [] : dashboardPayload.fleet?.combined_monthly || [];
+  const dailyRows = scopedMachine ? scopedMachine.daily || [] : dashboardPayload.fleet?.combined_daily || [];
+  const monthlyRow = monthlyRows.find((row) => row.month === month);
+  const monthDailyRows = filledDailyRowsForMonth(dailyRows, month);
+  const monthlyTotal = Number(monthlyRow?.value ?? sumRows(monthDailyRows));
+  const dailyTotal = sumRows(monthDailyRows);
+  const activeDays = monthDailyRows.filter((row) => Number(row.value || 0) > 0 || Number(row.thread_count || 0) > 0).length;
+  const dailyDetailIsComplete = monthlyTotal === dailyTotal;
+  if (!activeDrawerDay || !String(activeDrawerDay).startsWith(`${month}-`)) {
+    activeDrawerDay = defaultDayForMonth(monthDailyRows);
+  }
+  const selectedDayRow = monthDailyRows.find((row) => row.day === activeDrawerDay) || {
+    day: activeDrawerDay,
+    value: 0,
+    thread_count: 0,
+  };
+  const selectedDayTokens = Number(selectedDayRow.value || 0);
+  const selectedDayThreads = Number(selectedDayRow.thread_count || 0);
+  const selectedDayShare = monthlyTotal ? (selectedDayTokens * 100.0) / monthlyTotal : null;
+  const drawerMachines = scopedMachine ? [scopedMachine] : dashboardPayload.fleet?.machines || [];
+  const selectedMachineRows = drawerMachines
+    .map((machine) => {
+      const machineDayRow = (machine.daily || []).find((row) => row.day === activeDrawerDay);
+      const tokens = Number(machineDayRow?.value || 0);
+      const threadCount = Number(machineDayRow?.thread_count || 0);
+      const hasDayData = scopedMachine || tokens > 0 || threadCount > 0;
+      return {
+        title: machineDisplayName(machine),
+        value: formatTokens(tokens),
+        sortValue: tokens,
+        meta: [
+          `${formatTokens(threadCount)} threads`,
+          machineStatusText(machine),
+          selectedDayTokens && !scopedMachine ? `${formatPercent((tokens * 100.0) / selectedDayTokens)} of day` : "",
+          scopedMachine && selectedDayShare !== null ? `${formatPercent(selectedDayShare)} of machine month` : "",
+        ]
+          .filter(Boolean)
+          .join(" · "),
+        hasDayData,
+      };
+    })
+    .filter((row) => row.hasDayData)
+    .sort((left, right) => right.sortValue - left.sortValue);
+  const metaParts = [
+    scopeLabel,
+    activeDrawerDay ? formatDayName(activeDrawerDay) : formatMonthName(month),
+    `${formatTokens(monthlyTotal)} tokens in ${formatMonthName(month)}`,
+    `${formatTokens(activeDays)} active days`,
+  ];
+  if (!dailyDetailIsComplete) {
+    metaParts.push(`${formatTokens(dailyTotal)} tokens have daily detail`);
+  }
+
+  document.getElementById("month-drawer-title").textContent =
+    scopedMachine ? `${scopedMachine.label} · ${formatMonthName(month)}` : formatMonthName(month);
+  document.getElementById("month-drawer-meta").textContent = metaParts.join(" · ");
+  document.getElementById("month-machine-list-title").textContent = scopedMachine ? "Machine" : "Machines";
+  setHtml(
+    "month-drawer-metrics",
+    (scopedMachine
+      ? [
+          ["Day Tokens", formatTokens(selectedDayTokens)],
+          ["Day Threads", formatTokens(selectedDayThreads)],
+          ["Share of Machine Month", formatPercent(selectedDayShare)],
+          ["Machine Month", formatTokens(monthlyTotal)],
+        ]
+      : [
+          ["Day Tokens", formatTokens(selectedDayTokens)],
+          ["Day Threads", formatTokens(selectedDayThreads)],
+          ["Share of Month", formatPercent(selectedDayShare)],
+          ["Active Machines", formatTokens(selectedMachineRows.length)],
+        ])
+      .map(
+        ([label, value]) => `
+          <div class="metric">
+            <div class="metric-label">${label}</div>
+            <div class="metric-value">${value}</div>
+          </div>
+        `
+      )
+      .join("")
+  );
+
+  document.getElementById("month-daily-bars").innerHTML = renderAxisChart(monthDailyRows, {
+    labelKey: "day",
+    valueKey: "value",
+    emptyText: "No daily data for this month.",
+    height: 240,
+    labelFormatter: (row) => row.day.slice(-2),
+    metaFormatter: (row) => (row.thread_count ? `${formatTokens(row.thread_count)} th` : ""),
+    statusClass: (row) => (row.day === activeDrawerDay ? "is-selected" : ""),
+    tooltipFormatter: (row) =>
+      `${row.day}: ${formatTokens(row.value)} tokens · ${formatTokens(row.thread_count)} threads`,
+    barDataAttrs: (row) => ({ "month-drawer-day": row.day }),
+    barActionLabel: (row) => `Show stats for ${formatDayName(row.day)}`,
+  });
+
+  setHtml(
+    "month-machine-list",
+    renderRowList(selectedMachineRows, {
+      emptyText: "No machine data for this day.",
+      title: (row) => row.title,
+      value: (row) => row.value,
+      meta: (row) => row.meta,
+    })
+  );
+}
+
+function openMonthDrawer(month, machineHost = null) {
+  const scopedMachineHost = machineHost || null;
+  if (activeDrawerMonth !== month || activeDrawerMachineHost !== scopedMachineHost) {
+    activeDrawerDay = null;
+  }
+  activeDrawerMonth = month;
+  activeDrawerMachineHost = scopedMachineHost;
+  renderMonthDrawer(month);
+  monthDrawer.hidden = false;
+  monthDrawerBackdrop.hidden = false;
+  monthDrawer.setAttribute("aria-hidden", "false");
+  window.requestAnimationFrame(() => {
+    monthDrawer.classList.add("is-open");
+    monthDrawerBackdrop.classList.add("is-open");
+  });
+}
+
+function closeMonthDrawer() {
+  activeDrawerMonth = null;
+  activeDrawerDay = null;
+  activeDrawerMachineHost = null;
+  monthDrawer.classList.remove("is-open");
+  monthDrawerBackdrop.classList.remove("is-open");
+  monthDrawer.setAttribute("aria-hidden", "true");
+  window.setTimeout(() => {
+    if (!activeDrawerMonth) {
+      monthDrawer.hidden = true;
+      monthDrawerBackdrop.hidden = true;
+    }
+  }, 180);
+}
+
+function updateScrollTopButton() {
+  if (!scrollTopButton) {
+    return;
+  }
+  const shouldShow = window.scrollY > 360;
+  scrollTopButton.classList.toggle("is-visible", shouldShow);
+  if (shouldShow) {
+    scrollTopButton.removeAttribute("aria-hidden");
+    scrollTopButton.tabIndex = 0;
+  } else {
+    scrollTopButton.setAttribute("aria-hidden", "true");
+    scrollTopButton.tabIndex = -1;
+  }
+}
+
+function requestScrollTopButtonUpdate() {
+  if (scrollTopUpdatePending) {
+    return;
+  }
+  scrollTopUpdatePending = true;
+  window.requestAnimationFrame(() => {
+    scrollTopUpdatePending = false;
+    updateScrollTopButton();
+  });
 }
 
 function renderHighlights(source) {
@@ -596,6 +907,7 @@ function renderCostPanel(source) {
 }
 
 function renderDashboard(payload) {
+  dashboardPayload = payload;
   const source = payload.source;
   const monthlyRows = [...(payload.fleet?.combined_monthly || [])]
     .sort((left, right) => String(left.month).localeCompare(String(right.month)))
@@ -611,12 +923,14 @@ function renderDashboard(payload) {
   renderCoverage(payload);
   renderMetricCards(payload);
   renderFleetPanel(payload);
-  document.getElementById("monthly-bars").innerHTML = renderAxisChart(monthlyRows, {
+  monthlyBars.innerHTML = renderAxisChart(monthlyRows, {
     labelKey: "month",
     valueKey: "value",
     emptyText: "No monthly data.",
     labelFormatter: (row) => normaliseBarLabel(row.month, "month"),
     tooltipFormatter: (row) => `${row.month}: ${formatTokens(row.value)} tokens`,
+    barDataAttrs: (row) => ({ "month-drawer-month": row.month }),
+    barActionLabel: (row) => `Open daily usage for ${formatMonthName(row.month)}`,
   });
   document.getElementById("machine-bars").innerHTML = renderAxisChart(machineRows, {
     labelKey: "label",
@@ -664,6 +978,9 @@ function renderDashboard(payload) {
   renderRemoteMachines(payload);
   renderMachineMonthlyGrid(payload);
   renderCostPanel(source);
+  if (activeDrawerMonth) {
+    renderMonthDrawer(activeDrawerMonth);
+  }
 }
 
 function setRefreshButtonState(state) {
@@ -763,5 +1080,57 @@ refreshButton.addEventListener("click", () => {
     window.alert(error.message);
   });
 });
+
+monthlyBars.addEventListener("click", (event) => {
+  if (!(event.target instanceof Element)) {
+    return;
+  }
+  const trigger = event.target.closest("[data-month-drawer-month]");
+  if (!trigger) {
+    return;
+  }
+  openMonthDrawer(trigger.dataset.monthDrawerMonth);
+});
+
+machineMonthlyGrid.addEventListener("click", (event) => {
+  if (!(event.target instanceof Element)) {
+    return;
+  }
+  const trigger = event.target.closest("[data-month-drawer-month]");
+  if (!trigger) {
+    return;
+  }
+  openMonthDrawer(trigger.dataset.monthDrawerMonth, trigger.dataset.monthDrawerMachine);
+});
+
+monthDailyBars.addEventListener("click", (event) => {
+  if (!(event.target instanceof Element)) {
+    return;
+  }
+  const trigger = event.target.closest("[data-month-drawer-day]");
+  if (!trigger || !activeDrawerMonth) {
+    return;
+  }
+  activeDrawerDay = trigger.dataset.monthDrawerDay;
+  renderMonthDrawer(activeDrawerMonth);
+});
+
+monthDrawerClose.addEventListener("click", closeMonthDrawer);
+monthDrawerBackdrop.addEventListener("click", closeMonthDrawer);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && activeDrawerMonth) {
+    closeMonthDrawer();
+  }
+});
+
+if (scrollTopButton) {
+  scrollTopButton.tabIndex = -1;
+  scrollTopButton.addEventListener("click", () => {
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  });
+  window.addEventListener("scroll", requestScrollTopButtonUpdate, { passive: true });
+  window.addEventListener("resize", requestScrollTopButtonUpdate);
+  updateScrollTopButton();
+}
 
 fetchDashboard().catch((error) => window.alert(error.message));
