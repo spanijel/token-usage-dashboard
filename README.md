@@ -6,7 +6,7 @@ and from configured remote machines over SSH.
 Canonical Git repo:
 
 ```text
-git@gitlab.geo.arm.com:gpu/shared/token-usage-dashboard.git
+git@gitlab.geo.arm.com:gpu/shared/gpu_model/token-usage-dashboard.git
 ```
 
 ## What it shows
