@@ -8,11 +8,17 @@ const monthDrawerBackdrop = document.getElementById("month-drawer-backdrop");
 const monthDrawerClose = document.getElementById("month-drawer-close");
 const monthDailyBars = document.getElementById("month-daily-bars");
 const scrollTopButton = document.getElementById("scroll-top-button");
+const tokenActivity = document.getElementById("token-activity");
+const activitySummary = document.getElementById("activity-summary");
+const activityScopeSelect = document.getElementById("activity-scope");
+const activityModeButtons = Array.from(document.querySelectorAll("[data-activity-mode]"));
 const refreshButtonDefaultLabel = refreshButton ? refreshButton.textContent : "Refresh";
 let dashboardPayload = null;
 let activeDrawerMonth = null;
 let activeDrawerDay = null;
 let activeDrawerMachineHost = null;
+let activeActivityMode = "daily";
+let activeActivityScope = "fleet";
 let scrollTopUpdatePending = false;
 
 function formatNumber(value, digits = 0) {
@@ -120,6 +126,57 @@ function formatDayName(day) {
     day: "numeric",
     year: "numeric",
   });
+}
+
+function parseDateKey(day) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(day || ""));
+  if (!match) {
+    return null;
+  }
+  return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+}
+
+function dateKey(date) {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+}
+
+function monthKeyFromDate(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function addDays(date, days) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate() + days);
+}
+
+function startOfWeek(date) {
+  return addDays(date, -date.getDay());
+}
+
+function endOfWeek(date) {
+  return addDays(date, 6 - date.getDay());
+}
+
+function todayDate() {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+}
+
+function formatActivityMonth(date) {
+  return date.toLocaleDateString(undefined, { month: "short" });
+}
+
+function activityModeLabel(mode = activeActivityMode) {
+  if (mode === "weekly") {
+    return "Weekly";
+  }
+  if (mode === "cumulative") {
+    return "Cumulative";
+  }
+  return "Daily";
 }
 
 function niceStep(rawValue) {
@@ -435,6 +492,304 @@ function renderMachineMonthlyGrid(payload) {
   );
 }
 
+function normaliseActivityRows(rows) {
+  const byDay = new Map();
+  for (const row of rows || []) {
+    const parsed = parseDateKey(row.day);
+    if (!parsed) {
+      continue;
+    }
+    const day = dateKey(parsed);
+    const bucket = byDay.get(day) || { day, value: 0, thread_count: 0 };
+    bucket.value += Number(row.value || 0);
+    bucket.thread_count += Number(row.thread_count || 0);
+    byDay.set(day, bucket);
+  }
+  return [...byDay.values()].sort((left, right) => left.day.localeCompare(right.day));
+}
+
+function activityRowsForScope(payload) {
+  if (activeActivityScope !== "fleet") {
+    const machine = (payload.fleet?.machines || []).find((row) => row.host === activeActivityScope);
+    if (machine) {
+      return machine.daily || [];
+    }
+    activeActivityScope = "fleet";
+  }
+  return payload.fleet?.combined_daily || [];
+}
+
+function activityScopeLabel(payload) {
+  if (activeActivityScope === "fleet") {
+    return "Fleet";
+  }
+  const machine = (payload.fleet?.machines || []).find((row) => row.host === activeActivityScope);
+  return machine ? machineDisplayName(machine) : "Fleet";
+}
+
+function renderActivityScopeOptions(payload) {
+  if (!activityScopeSelect) {
+    return;
+  }
+  const options = [
+    { value: "fleet", label: "Fleet" },
+    ...(payload.fleet?.machines || []).map((machine) => ({
+      value: machine.host,
+      label: machineDisplayName(machine),
+    })),
+  ];
+  if (!options.some((option) => option.value === activeActivityScope)) {
+    activeActivityScope = "fleet";
+  }
+  activityScopeSelect.innerHTML = options
+    .map(
+      (option) => `
+        <option value="${escapeHtml(option.value)}"${option.value === activeActivityScope ? " selected" : ""}>
+          ${escapeHtml(option.label)}
+        </option>
+      `
+    )
+    .join("");
+}
+
+function buildActivityTimeline(rows, mode) {
+  const normalizedRows = normaliseActivityRows(rows);
+  const today = todayDate();
+  const latestRow = normalizedRows.length ? normalizedRows[normalizedRows.length - 1] : null;
+  const latestDate = latestRow ? parseDateKey(latestRow.day) : null;
+  const endDate = latestDate && latestDate > today ? latestDate : today;
+  const startDate = addDays(endDate, -364);
+  const startKey = dateKey(startDate);
+  const endKey = dateKey(endDate);
+  const gridStart = startOfWeek(startDate);
+  const gridEnd = endOfWeek(endDate);
+  const rawByDay = new Map(normalizedRows.map((row) => [row.day, row]));
+  const valuesByDay = new Map();
+  const rollingValues = [];
+  let rollingTotal = 0;
+  let cumulativeTotal = 0;
+
+  for (let date = startDate; date <= endDate; date = addDays(date, 1)) {
+    const day = dateKey(date);
+    const raw = rawByDay.get(day) || { day, value: 0, thread_count: 0 };
+    const rawValue = Number(raw.value || 0);
+    rollingValues.push(rawValue);
+    rollingTotal += rawValue;
+    if (rollingValues.length > 7) {
+      rollingTotal -= rollingValues.shift();
+    }
+    cumulativeTotal += rawValue;
+    const weeklyValue = rollingTotal;
+    const cumulativeValue = cumulativeTotal;
+    let value = rawValue;
+    if (mode === "weekly") {
+      value = weeklyValue;
+    } else if (mode === "cumulative") {
+      value = cumulativeValue;
+    }
+    valuesByDay.set(day, {
+      day,
+      value,
+      rawValue,
+      weeklyValue,
+      cumulativeValue,
+      thread_count: Number(raw.thread_count || 0),
+      inRange: true,
+    });
+  }
+
+  const weeks = [];
+  const cells = [];
+  let weekIndex = 0;
+  for (let weekStart = gridStart; weekStart <= gridEnd; weekStart = addDays(weekStart, 7)) {
+    weekIndex += 1;
+    weeks.push({ index: weekIndex, start: dateKey(weekStart) });
+    for (let offset = 0; offset < 7; offset += 1) {
+      const date = addDays(weekStart, offset);
+      const day = dateKey(date);
+      const inRange = day >= startKey && day <= endKey;
+      const values = valuesByDay.get(day) || {
+        day,
+        value: 0,
+        rawValue: 0,
+        weeklyValue: 0,
+        cumulativeValue: 0,
+        thread_count: 0,
+      };
+      cells.push({
+        ...values,
+        day,
+        date,
+        inRange,
+        weekIndex,
+        dayOfWeek: offset,
+        month: monthKeyFromDate(date),
+      });
+    }
+  }
+
+  return {
+    normalizedRows,
+    cells,
+    values: [...valuesByDay.values()],
+    weeks,
+    startDate,
+    endDate,
+    startKey,
+    endKey,
+  };
+}
+
+function buildActivityMonthLabels(timeline) {
+  const labels = [];
+  const seen = new Set();
+  for (const week of timeline.weeks) {
+    const weekStart = parseDateKey(week.start);
+    let label = "";
+    for (let offset = 0; offset < 7; offset += 1) {
+      const date = addDays(weekStart, offset);
+      const day = dateKey(date);
+      if (day < timeline.startKey || day > timeline.endKey) {
+        continue;
+      }
+      const month = monthKeyFromDate(date);
+      if (!seen.has(month)) {
+        seen.add(month);
+        label = formatActivityMonth(date);
+        break;
+      }
+    }
+    labels.push({ index: week.index, label });
+  }
+  return labels;
+}
+
+function activityLevel(value, maxValue) {
+  if (!value || value <= 0 || !maxValue || maxValue <= 0) {
+    return 0;
+  }
+  return Math.max(1, Math.ceil(Math.min(value / maxValue, 1) * 5));
+}
+
+function activityCellTitle(cell, mode) {
+  const dayTokens = `${formatTokens(cell.rawValue)} tokens`;
+  const threads = `${formatTokens(cell.thread_count)} threads`;
+  if (mode === "weekly") {
+    return `${formatDayName(cell.day)} · ${formatTokens(cell.weeklyValue)} tokens over 7 days · ${dayTokens} on day`;
+  }
+  if (mode === "cumulative") {
+    return `${formatDayName(cell.day)} · ${formatTokens(cell.cumulativeValue)} cumulative tokens · ${dayTokens} on day`;
+  }
+  return `${formatDayName(cell.day)} · ${dayTokens} · ${threads}`;
+}
+
+function renderActivitySummary(payload, timeline, scopeLabel) {
+  if (!activitySummary) {
+    return;
+  }
+  const activeDays = timeline.values.filter(
+    (row) => Number(row.rawValue || 0) > 0 || Number(row.thread_count || 0) > 0
+  );
+  const rawTotal = sumRows(timeline.values, "rawValue");
+  const peak = [...timeline.values].sort((left, right) => Number(right.value || 0) - Number(left.value || 0))[0];
+  const peakLabel = activeActivityMode === "weekly" ? "Peak Week" : activeActivityMode === "cumulative" ? "Range Total" : "Peak Day";
+  const peakValue = peak ? `${formatCompactNumber(peak.value)} · ${peak.day.slice(5)}` : "n/a";
+  const items = [
+    ["Scope", scopeLabel],
+    ["Mode", activityModeLabel()],
+    ["Raw Tokens", formatTokens(rawTotal)],
+    ["Active Days", formatTokens(activeDays.length)],
+    [peakLabel, peakValue],
+  ];
+  activitySummary.innerHTML = items
+    .map(
+      ([label, value]) => `
+        <div class="activity-stat">
+          <div class="metric-label">${escapeHtml(label)}</div>
+          <div class="activity-stat-value">${escapeHtml(value)}</div>
+        </div>
+      `
+    )
+    .join("");
+}
+
+function updateActivityModeButtons() {
+  for (const button of activityModeButtons) {
+    const isActive = button.dataset.activityMode === activeActivityMode;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-selected", isActive ? "true" : "false");
+  }
+}
+
+function renderTokenActivity(payload) {
+  if (!tokenActivity) {
+    return;
+  }
+  renderActivityScopeOptions(payload);
+  updateActivityModeButtons();
+  const scopeLabel = activityScopeLabel(payload);
+  const timeline = buildActivityTimeline(activityRowsForScope(payload), activeActivityMode);
+  const maxValue = Math.max(...timeline.values.map((row) => Number(row.value || 0)), 0);
+  const monthLabels = buildActivityMonthLabels(timeline);
+  renderActivitySummary(payload, timeline, scopeLabel);
+
+  tokenActivity.innerHTML = `
+    <div class="activity-map-scroll">
+      <div class="activity-map-inner" style="--activity-columns: ${timeline.weeks.length}">
+        <div class="activity-weekdays" aria-hidden="true">
+          <span></span>
+          <span>Mon</span>
+          <span></span>
+          <span>Wed</span>
+          <span></span>
+          <span>Fri</span>
+          <span></span>
+        </div>
+        <div
+          class="activity-grid"
+          role="grid"
+          aria-label="${escapeHtml(`${scopeLabel} ${activityModeLabel().toLowerCase()} token activity from ${formatDayName(dateKey(timeline.startDate))} to ${formatDayName(dateKey(timeline.endDate))}`)}"
+        >
+          ${timeline.cells
+            .map((cell) => {
+              const level = activityLevel(cell.value, maxValue);
+              const title = cell.inRange ? activityCellTitle(cell, activeActivityMode) : "";
+              const dataAttrs = cell.inRange
+                ? renderDataAttributes({
+                    "activity-day": cell.day,
+                    "activity-machine": activeActivityScope === "fleet" ? "" : activeActivityScope,
+                  })
+                : "";
+              return `
+                <button
+                  class="activity-cell activity-level-${level}${cell.inRange ? "" : " is-outside-range"}"
+                  type="button"
+                  style="grid-column: ${cell.weekIndex}; grid-row: ${cell.dayOfWeek + 1}"
+                  ${dataAttrs}
+                  ${cell.inRange ? "" : "disabled"}
+                  aria-label="${escapeHtml(title || "Outside visible range")}"
+                  title="${escapeHtml(title)}"
+                >
+                  <span class="sr-only">${escapeHtml(title)}</span>
+                </button>
+              `;
+            })
+            .join("")}
+        </div>
+        <div class="activity-months" aria-hidden="true">
+          ${monthLabels
+            .map(
+              (item) => `
+                <span style="grid-column: ${item.index}">${escapeHtml(item.label)}</span>
+              `
+            )
+            .join("")}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function sumRows(rows, key = "value") {
   return (rows || []).reduce((total, row) => total + Number(row[key] || 0), 0);
 }
@@ -625,10 +980,13 @@ function renderMonthDrawer(month) {
   );
 }
 
-function openMonthDrawer(month, machineHost = null) {
+function openMonthDrawer(month, machineHost = null, day = null) {
   const scopedMachineHost = machineHost || null;
   if (activeDrawerMonth !== month || activeDrawerMachineHost !== scopedMachineHost) {
     activeDrawerDay = null;
+  }
+  if (day) {
+    activeDrawerDay = day;
   }
   activeDrawerMonth = month;
   activeDrawerMachineHost = scopedMachineHost;
@@ -923,6 +1281,7 @@ function renderDashboard(payload) {
   renderCoverage(payload);
   renderMetricCards(payload);
   renderFleetPanel(payload);
+  renderTokenActivity(payload);
   monthlyBars.innerHTML = renderAxisChart(monthlyRows, {
     labelKey: "month",
     valueKey: "value",
@@ -1080,6 +1439,45 @@ refreshButton.addEventListener("click", () => {
     window.alert(error.message);
   });
 });
+
+if (activityScopeSelect) {
+  activityScopeSelect.addEventListener("change", () => {
+    activeActivityScope = activityScopeSelect.value || "fleet";
+    if (dashboardPayload) {
+      renderTokenActivity(dashboardPayload);
+    }
+  });
+}
+
+for (const button of activityModeButtons) {
+  button.addEventListener("click", () => {
+    const requestedMode = button.dataset.activityMode || "daily";
+    if (requestedMode === activeActivityMode) {
+      return;
+    }
+    activeActivityMode = requestedMode;
+    if (dashboardPayload) {
+      renderTokenActivity(dashboardPayload);
+    }
+  });
+}
+
+if (tokenActivity) {
+  tokenActivity.addEventListener("click", (event) => {
+    if (!(event.target instanceof Element)) {
+      return;
+    }
+    const trigger = event.target.closest("[data-activity-day]");
+    if (!trigger) {
+      return;
+    }
+    const day = trigger.dataset.activityDay;
+    if (!day) {
+      return;
+    }
+    openMonthDrawer(day.slice(0, 7), trigger.dataset.activityMachine || null, day);
+  });
+}
 
 monthlyBars.addEventListener("click", (event) => {
   if (!(event.target instanceof Element)) {

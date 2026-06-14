@@ -22,6 +22,38 @@
       </section>
 
       <section class="dashboard-grid">
+        <article class="panel panel-span-2 token-activity-panel">
+          <div class="activity-head">
+            <div>
+              <p class="kicker">Usage Calendar</p>
+              <h2>Token activity</h2>
+              <p class="section-note">Last twelve months across the selected Codex scope.</p>
+            </div>
+            <div class="activity-controls">
+              <label class="activity-scope-label" for="activity-scope">
+                Scope
+                <select id="activity-scope" aria-label="Token activity scope"></select>
+              </label>
+              <div class="segmented-control" role="tablist" aria-label="Token activity mode">
+                <button class="activity-mode is-active" type="button" role="tab" aria-selected="true" data-activity-mode="daily">Daily</button>
+                <button class="activity-mode" type="button" role="tab" aria-selected="false" data-activity-mode="weekly">Weekly</button>
+                <button class="activity-mode" type="button" role="tab" aria-selected="false" data-activity-mode="cumulative">Cumulative</button>
+              </div>
+            </div>
+          </div>
+          <div id="activity-summary" class="activity-summary"></div>
+          <div id="token-activity" class="token-activity"></div>
+          <div class="activity-legend" aria-hidden="true">
+            <span>Less</span>
+            <span class="activity-swatch activity-level-1"></span>
+            <span class="activity-swatch activity-level-2"></span>
+            <span class="activity-swatch activity-level-3"></span>
+            <span class="activity-swatch activity-level-4"></span>
+            <span class="activity-swatch activity-level-5"></span>
+            <span>More</span>
+          </div>
+        </article>
+
         <article class="panel summary-panel">
           <div class="card-head">
             <div>
