@@ -17,6 +17,7 @@ let dashboardPayload = null;
 let activeDrawerMonth = null;
 let activeDrawerDay = null;
 let activeDrawerMachineHost = null;
+let activeDrawerTypeScope = "month";
 let activeActivityMode = "daily";
 let activeActivityScope = "fleet";
 let scrollTopUpdatePending = false;
@@ -173,6 +174,9 @@ function activityModeLabel(mode = activeActivityMode) {
   if (mode === "weekly") {
     return "Weekly";
   }
+  if (mode === "monthly") {
+    return "Monthly";
+  }
   if (mode === "cumulative") {
     return "Cumulative";
   }
@@ -236,7 +240,7 @@ function renderMetricCards(payload) {
   const stats = source.stats || {};
   const cost = fleet.cost || {};
   const headlineCost =
-    cost.rough_cost_total_usd ?? cost.usage_cost_total_usd ?? null;
+    cost.api_equivalent_cost_total_usd ?? cost.rough_cost_total_usd ?? cost.usage_cost_total_usd ?? null;
   const items = [
     ["Fleet Tokens", formatTokens(fleet.combined_total_tokens)],
     ["Fleet 30 Days", formatTokens(fleet.combined_30d_tokens)],
@@ -249,7 +253,7 @@ function renderMetricCards(payload) {
     ["Local P90 / Thread", formatTokens(stats.p90_tokens_per_thread)],
     ["Local Largest Thread", formatTokens(stats.largest_thread_tokens)],
     ["Machines", formatTokens(fleet.machine_count)],
-    ["Fleet Rough Cost", headlineCost !== null && headlineCost !== undefined ? formatUsd(headlineCost) : "not set"],
+    ["Fleet API-Equivalent", headlineCost !== null && headlineCost !== undefined ? formatUsd(headlineCost) : "not set"],
   ];
   setHtml(
     "summary-metrics",
@@ -288,9 +292,11 @@ function renderFleetPanel(payload) {
       formatTokens((fleet.combined_7d_tokens || 0) - (payload.source.last_7_days || 0)),
     ],
     [
-      "Fleet Rough Cost",
-      cost.rough_cost_total_usd !== null && cost.rough_cost_total_usd !== undefined
-        ? formatUsd(cost.rough_cost_total_usd)
+      "Fleet API-Equivalent",
+      cost.api_equivalent_cost_total_usd !== null && cost.api_equivalent_cost_total_usd !== undefined
+        ? formatUsd(cost.api_equivalent_cost_total_usd)
+        : cost.rough_cost_total_usd !== null && cost.rough_cost_total_usd !== undefined
+          ? formatUsd(cost.rough_cost_total_usd)
         : cost.usage_cost_total_usd !== null && cost.usage_cost_total_usd !== undefined
           ? formatUsd(cost.usage_cost_total_usd)
           : "n/a",
@@ -519,6 +525,16 @@ function activityRowsForScope(payload) {
   return payload.fleet?.combined_daily || [];
 }
 
+function activityMonthlyRowsForScope(payload) {
+  if (activeActivityScope !== "fleet") {
+    const machine = (payload.fleet?.machines || []).find((row) => row.host === activeActivityScope);
+    if (machine) {
+      return machine.monthly || [];
+    }
+  }
+  return payload.fleet?.combined_monthly || [];
+}
+
 function activityScopeLabel(payload) {
   if (activeActivityScope === "fleet") {
     return "Fleet";
@@ -721,6 +737,82 @@ function updateActivityModeButtons() {
   }
 }
 
+function buildMonthlyActivityRows(rows) {
+  const byMonth = new Map(
+    (rows || []).map((row) => [
+      String(row.month || ""),
+      {
+        ...row,
+        month: String(row.month || ""),
+        value: Number(row.value || 0),
+        thread_count: Number(row.thread_count || 0),
+      },
+    ])
+  );
+  const currentMonth = monthKeyFromDate(todayDate());
+  const validMonths = [...byMonth.keys()].filter((month) => /^\d{4}-\d{2}$/.test(month)).sort();
+  const latestMonth = validMonths[validMonths.length - 1];
+  const endMonth = latestMonth && latestMonth > currentMonth ? latestMonth : currentMonth;
+  const [endYear, endMonthNumber] = endMonth.split("-").map(Number);
+
+  return Array.from({ length: 12 }, (_, index) => {
+    const date = new Date(endYear, endMonthNumber - 12 + index, 1);
+    const month = monthKeyFromDate(date);
+    return byMonth.get(month) || { month, value: 0, thread_count: 0 };
+  });
+}
+
+function renderMonthlyTokenActivity(payload, scopeLabel) {
+  const rows = buildMonthlyActivityRows(activityMonthlyRowsForScope(payload));
+  const maxValue = Math.max(...rows.map((row) => row.value), 0);
+  const activeMonths = rows.filter((row) => row.value > 0 || row.thread_count > 0);
+  const rangeTotal = sumRows(rows);
+  const peak = [...rows].sort((left, right) => right.value - left.value)[0];
+  const summaryItems = [
+    ["Scope", scopeLabel],
+    ["Mode", activityModeLabel()],
+    ["Range Tokens", formatTokens(rangeTotal)],
+    ["Active Months", formatTokens(activeMonths.length)],
+    ["Peak Month", peak ? `${formatCompactNumber(peak.value)} · ${normaliseBarLabel(peak.month, "month")}` : "n/a"],
+  ];
+  activitySummary.innerHTML = summaryItems
+    .map(
+      ([label, value]) => `
+        <div class="activity-stat">
+          <div class="metric-label">${escapeHtml(label)}</div>
+          <div class="activity-stat-value">${escapeHtml(value)}</div>
+        </div>
+      `
+    )
+    .join("");
+
+  tokenActivity.innerHTML = `
+    <div class="monthly-activity-grid" role="grid" aria-label="${escapeHtml(`${scopeLabel} monthly token activity for the last twelve months`)}">
+      ${rows
+        .map((row) => {
+          const title = `${formatMonthName(row.month)} · ${formatTokens(row.value)} tokens · ${formatTokens(row.thread_count)} threads`;
+          return `
+            <button
+              class="monthly-activity-cell activity-level-${activityLevel(row.value, maxValue)}"
+              type="button"
+              ${renderDataAttributes({
+                "activity-month": row.month,
+                "activity-machine": activeActivityScope === "fleet" ? "" : activeActivityScope,
+              })}
+              aria-label="${escapeHtml(title)}"
+              title="${escapeHtml(title)}"
+            >
+              <span class="monthly-activity-label">${escapeHtml(normaliseBarLabel(row.month, "month"))}</span>
+              <strong>${escapeHtml(formatCompactNumber(row.value))}</strong>
+              <span>${escapeHtml(`${formatTokens(row.thread_count)} threads`)}</span>
+            </button>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
 function renderTokenActivity(payload) {
   if (!tokenActivity) {
     return;
@@ -728,6 +820,10 @@ function renderTokenActivity(payload) {
   renderActivityScopeOptions(payload);
   updateActivityModeButtons();
   const scopeLabel = activityScopeLabel(payload);
+  if (activeActivityMode === "monthly") {
+    renderMonthlyTokenActivity(payload, scopeLabel);
+    return;
+  }
   const timeline = buildActivityTimeline(activityRowsForScope(payload), activeActivityMode);
   const maxValue = Math.max(...timeline.values.map((row) => Number(row.value || 0)), 0);
   const monthLabels = buildActivityMonthLabels(timeline);
@@ -811,6 +907,7 @@ function filledDailyRowsForMonth(rows, month) {
     const day = `${month}-${String(index + 1).padStart(2, "0")}`;
     const existing = byDay.get(day);
     return {
+      ...(existing || {}),
       day,
       value: existing ? Number(existing.value || 0) : 0,
       thread_count: existing ? Number(existing.thread_count || 0) : 0,
@@ -863,6 +960,73 @@ function machineDisplayName(machine) {
     return machine.label;
   }
   return `${machine.label} (${machine.host})`;
+}
+
+function tokenUsageForRow(row) {
+  const total = Number(row?.total_tokens ?? row?.value ?? 0);
+  const input = Number(row?.input_tokens || 0);
+  const cached = Math.min(Number(row?.cached_input_tokens || 0), input);
+  const output = Number(row?.output_tokens || 0);
+  const reasoning = Math.min(Number(row?.reasoning_output_tokens || 0), output);
+  return {
+    total,
+    input,
+    cached,
+    uncached: Number(row?.uncached_input_tokens ?? Math.max(input - cached, 0)),
+    output,
+    reasoning,
+    nonReasoning: Number(row?.non_reasoning_output_tokens ?? Math.max(output - reasoning, 0)),
+    unclassified: Number(row?.unclassified_tokens ?? Math.max(total - input - output, 0)),
+    threadCount: Number(row?.thread_count || 0),
+    typedThreadCount: Number(row?.typed_thread_count || 0),
+    coverage: Number(row?.detail_coverage_pct || 0),
+  };
+}
+
+function renderTokenTypeDetail(row) {
+  const usage = tokenUsageForRow(row);
+  const rows = [
+    { label: "Input", value: usage.input, tone: "input" },
+    { label: "Cached input", value: usage.cached, parent: usage.input, child: true, tone: "cached" },
+    { label: "Uncached input", value: usage.uncached, parent: usage.input, child: true, tone: "uncached" },
+    { label: "Output", value: usage.output, tone: "output" },
+    { label: "Reasoning output", value: usage.reasoning, parent: usage.output, child: true, tone: "reasoning" },
+    {
+      label: "Non-reasoning output",
+      value: usage.nonReasoning,
+      parent: usage.output,
+      child: true,
+      tone: "non-reasoning",
+    },
+  ];
+  if (usage.unclassified > 0) {
+    rows.push({ label: "Unclassified", value: usage.unclassified, tone: "unclassified" });
+  }
+  const detailRows = rows
+    .map((item) => {
+      const totalShare = usage.total ? (item.value * 100) / usage.total : 0;
+      const parentShare = item.parent ? (item.value * 100) / item.parent : null;
+      return `
+        <div class="token-type-row${item.child ? " is-child" : ""}">
+          <div class="token-type-label">${escapeHtml(item.label)}</div>
+          <div class="token-type-track" aria-hidden="true">
+            <div class="token-type-fill is-${item.tone}" style="width:${Math.max(totalShare, item.value > 0 ? 1 : 0)}%"></div>
+          </div>
+          <div class="token-type-value">
+            <strong>${formatTokens(item.value)}</strong>
+            <span>${formatPercent(totalShare)} total${parentShare === null ? "" : ` · ${formatPercent(parentShare)} parent`}</span>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+  return `
+    <div class="token-type-total">
+      <span>Total</span>
+      <strong>${formatTokens(usage.total)}</strong>
+    </div>
+    ${detailRows}
+  `;
 }
 
 function renderMonthDrawer(month) {
@@ -955,6 +1119,27 @@ function renderMonthDrawer(month) {
       .join("")
   );
 
+  const typeDetailRow =
+    activeDrawerTypeScope === "day"
+      ? selectedDayRow
+      : monthlyRow || { value: monthlyTotal, thread_count: monthDailyRows.reduce((sum, row) => sum + Number(row.thread_count || 0), 0) };
+  const typeUsage = tokenUsageForRow(typeDetailRow);
+  const typePeriodLabel =
+    activeDrawerTypeScope === "day" && activeDrawerDay
+      ? formatDayName(activeDrawerDay)
+      : formatMonthName(month);
+  setHtml("month-token-types", renderTokenTypeDetail(typeDetailRow));
+  document.getElementById("token-type-detail-meta").textContent = [
+    typePeriodLabel,
+    `${formatTokens(typeUsage.typedThreadCount)}/${formatTokens(typeUsage.threadCount)} threads with typed detail`,
+    `${formatPercent(typeUsage.coverage)} coverage`,
+  ].join(" · ");
+  monthDrawer.querySelectorAll("[data-token-type-scope]").forEach((button) => {
+    const selected = button.dataset.tokenTypeScope === activeDrawerTypeScope;
+    button.classList.toggle("is-active", selected);
+    button.setAttribute("aria-pressed", selected ? "true" : "false");
+  });
+
   document.getElementById("month-daily-bars").innerHTML = renderAxisChart(monthDailyRows, {
     labelKey: "day",
     valueKey: "value",
@@ -988,6 +1173,7 @@ function openMonthDrawer(month, machineHost = null, day = null) {
   if (day) {
     activeDrawerDay = day;
   }
+  activeDrawerTypeScope = day ? "day" : "month";
   activeDrawerMonth = month;
   activeDrawerMachineHost = scopedMachineHost;
   renderMonthDrawer(month);
@@ -1004,6 +1190,7 @@ function closeMonthDrawer() {
   activeDrawerMonth = null;
   activeDrawerDay = null;
   activeDrawerMachineHost = null;
+  activeDrawerTypeScope = "month";
   monthDrawer.classList.remove("is-open");
   monthDrawerBackdrop.classList.remove("is-open");
   monthDrawer.setAttribute("aria-hidden", "true");
@@ -1187,6 +1374,9 @@ function renderBreakdowns(payload) {
 
 function renderRemoteMachines(payload) {
   const rows = (payload.fleet?.machines || []).map((row) => {
+    const dedupeNote = row.deduplicated_subagent_count
+      ? ` · ${formatTokens(row.deduplicated_subagent_count)} repeated subagent counters excluded`
+      : "";
     if (row.status === "error") {
       return {
         title: `${row.label}${row.host && row.host !== "local" ? ` (${row.host})` : ""}`,
@@ -1198,13 +1388,13 @@ function renderRemoteMachines(payload) {
       return {
         title: `${row.label} (${row.host})`,
         value: formatTokens(row.total_tokens),
-        meta: `cached snapshot · ${formatTokens(row.thread_count)} threads · 30d ${formatTokens(row.tokens_30d)} · 7d ${formatTokens(row.tokens_7d)}${row.cache_notice ? ` · ${row.cache_notice}` : ""}`,
+        meta: `cached snapshot · ${formatTokens(row.thread_count)} threads · 30d ${formatTokens(row.tokens_30d)} · 7d ${formatTokens(row.tokens_7d)}${dedupeNote}${row.cache_notice ? ` · ${row.cache_notice}` : ""}`,
       };
     }
     return {
       title: `${row.label}${row.host && row.host !== "local" ? ` (${row.host})` : ""}`,
       value: formatTokens(row.total_tokens),
-      meta: `${formatTokens(row.thread_count)} threads · 30d ${formatTokens(row.tokens_30d)} · 7d ${formatTokens(row.tokens_7d)}`,
+      meta: `${formatTokens(row.thread_count)} threads · 30d ${formatTokens(row.tokens_30d)} · 7d ${formatTokens(row.tokens_7d)}${dedupeNote}`,
     };
   });
   setHtml(
@@ -1218,11 +1408,26 @@ function renderRemoteMachines(payload) {
   );
 }
 
-function renderCostPanel(source) {
-  const pricing = source.pricing || {};
-  const cost = source.cost || {};
+function renderCostPanel(payload) {
+  const pricing = payload.fleet?.pricing || payload.source?.pricing || {};
+  const cost = payload.fleet?.cost || payload.source?.cost || {};
   let details;
-  if (cost.kind === "official_gpt54_rough") {
+  if (cost.kind === "official_api_equivalent") {
+    details = [
+      ["Pricing label", pricing.label || "not set"],
+      ["API-equivalent total", cost.api_equivalent_cost_total_usd !== null && cost.api_equivalent_cost_total_usd !== undefined ? formatUsd(cost.api_equivalent_cost_total_usd) : "not set"],
+      ["Latest month", cost.latest_month_api_equivalent_cost_usd !== null && cost.latest_month_api_equivalent_cost_usd !== undefined ? formatUsd(cost.latest_month_api_equivalent_cost_usd) : "not set"],
+      ["Pricing coverage", formatPercent(cost.pricing_coverage_pct)],
+      ["Unpriced tokens", formatTokens(cost.unpriced_tokens)],
+      ["Cached-input cost", formatUsd(cost.cached_input_cost_usd)],
+      ["Uncached-input cost", formatUsd(cost.uncached_input_cost_usd)],
+      ["Output cost", formatUsd(cost.output_cost_usd)],
+      ["Effective rate / 1M", cost.effective_rate_per_million !== null && cost.effective_rate_per_million !== undefined ? formatUsd(cost.effective_rate_per_million) : "n/a"],
+      ["Rates updated", cost.rates_updated_at || "not set"],
+      ["Meaning", "API-equivalent estimate, not your Codex subscription invoice"],
+      ["Method", cost.notes || "Measured token types priced by public model"],
+    ];
+  } else if (cost.kind === "official_gpt54_rough") {
     details = [
       ["Pricing label", pricing.label || "not set"],
       ["Rough total", cost.rough_cost_total_usd !== null && cost.rough_cost_total_usd !== undefined ? formatUsd(cost.rough_cost_total_usd) : "not set"],
@@ -1336,7 +1541,7 @@ function renderDashboard(payload) {
   renderBreakdowns(payload);
   renderRemoteMachines(payload);
   renderMachineMonthlyGrid(payload);
-  renderCostPanel(source);
+  renderCostPanel(payload);
   if (activeDrawerMonth) {
     renderMonthDrawer(activeDrawerMonth);
   }
@@ -1467,6 +1672,14 @@ if (tokenActivity) {
     if (!(event.target instanceof Element)) {
       return;
     }
+    const monthTrigger = event.target.closest("[data-activity-month]");
+    if (monthTrigger) {
+      openMonthDrawer(
+        monthTrigger.dataset.activityMonth,
+        monthTrigger.dataset.activityMachine || null
+      );
+      return;
+    }
     const trigger = event.target.closest("[data-activity-day]");
     if (!trigger) {
       return;
@@ -1510,6 +1723,19 @@ monthDailyBars.addEventListener("click", (event) => {
     return;
   }
   activeDrawerDay = trigger.dataset.monthDrawerDay;
+  activeDrawerTypeScope = "day";
+  renderMonthDrawer(activeDrawerMonth);
+});
+
+monthDrawer.addEventListener("click", (event) => {
+  if (!(event.target instanceof Element)) {
+    return;
+  }
+  const trigger = event.target.closest("[data-token-type-scope]");
+  if (!trigger || !activeDrawerMonth) {
+    return;
+  }
+  activeDrawerTypeScope = trigger.dataset.tokenTypeScope === "day" ? "day" : "month";
   renderMonthDrawer(activeDrawerMonth);
 });
 

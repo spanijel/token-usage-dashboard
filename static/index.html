@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Codex Usage Observatory</title>
     <link rel="icon" href="/static/favicon.svg?v=2" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/app.css" />
+    <link rel="stylesheet" href="/static/app.css?v=20260727-2" />
   </head>
   <body>
     <div class="backdrop"></div>
@@ -37,6 +37,7 @@
               <div class="segmented-control" role="tablist" aria-label="Token activity mode">
                 <button class="activity-mode is-active" type="button" role="tab" aria-selected="true" data-activity-mode="daily">Daily</button>
                 <button class="activity-mode" type="button" role="tab" aria-selected="false" data-activity-mode="weekly">Weekly</button>
+                <button class="activity-mode" type="button" role="tab" aria-selected="false" data-activity-mode="monthly">Monthly</button>
                 <button class="activity-mode" type="button" role="tab" aria-selected="false" data-activity-mode="cumulative">Cumulative</button>
               </div>
             </div>
@@ -88,8 +89,8 @@
         <article class="panel">
           <div class="card-head compact-head">
             <div>
-              <p class="kicker">Official Default</p>
-              <h2>Cost Model and Override</h2>
+              <p class="kicker">API Equivalent</p>
+              <h2>Cost Estimate and Override</h2>
             </div>
           </div>
           <div id="cost-overview" class="details"></div>
@@ -185,18 +186,31 @@
     <aside id="month-drawer" class="month-drawer" aria-hidden="true" aria-labelledby="month-drawer-title">
       <div class="drawer-head">
         <div>
-          <p class="kicker">Daily Breakdown</p>
+          <p class="kicker">Usage Breakdown</p>
           <h2 id="month-drawer-title">Monthly Details</h2>
           <p id="month-drawer-meta" class="section-note"></p>
         </div>
         <button class="ghost" id="month-drawer-close" type="button">Close</button>
       </div>
       <div id="month-drawer-metrics" class="metrics"></div>
+      <section class="token-type-detail" aria-labelledby="token-type-detail-title">
+        <div class="token-type-detail-head">
+          <div>
+            <h3 id="token-type-detail-title">Token Types</h3>
+            <p id="token-type-detail-meta" class="section-note"></p>
+          </div>
+          <div class="token-type-scope" role="group" aria-label="Token type period">
+            <button type="button" data-token-type-scope="month" aria-pressed="true">Month</button>
+            <button type="button" data-token-type-scope="day" aria-pressed="false">Selected day</button>
+          </div>
+        </div>
+        <div id="month-token-types" class="token-type-list"></div>
+      </section>
       <div id="month-daily-bars" class="mini-bars"></div>
       <h3 id="month-machine-list-title">Machines</h3>
       <div id="month-machine-list" class="row-list"></div>
     </aside>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260727-2"></script>
   </body>
 </html>

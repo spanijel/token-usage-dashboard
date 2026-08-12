@@ -7,7 +7,7 @@ import re
 import shlex
 import sqlite3
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,30 +21,58 @@ HOME = Path.home()
 VS_CODE_GLOBAL_STORAGE = HOME / "Library/Application Support/Code/User/globalStorage"
 VS_CODE_STATE_DB = VS_CODE_GLOBAL_STORAGE / "state.vscdb"
 DOWNLOADS_DIR = HOME / "Downloads"
+CODEX_SESSIONS_DIR = HOME / ".codex" / "sessions"
+CODEX_APP_SNAPSHOT_FILE = DATA_DIR / "codex_app_sessions.json"
+TOKEN_TYPE_FIELDS = (
+    "total_tokens",
+    "input_tokens",
+    "cached_input_tokens",
+    "uncached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "non_reasoning_output_tokens",
+    "unclassified_tokens",
+)
 MONTH_PATTERN = re.compile(r"^\d{4}-\d{2}$")
 MANUAL_PROVIDERS = {
     "chatgpt": "ChatGPT",
     "copilot": "GitHub Copilot",
 }
+OFFICIAL_MODEL_PRICING = {
+    "gpt-5.6-sol": (5.00, 0.50, 30.00),
+    "gpt-5.6-terra": (2.50, 0.25, 15.00),
+    "gpt-5.6-luna": (1.00, 0.10, 6.00),
+    "gpt-5.5": (5.00, 0.50, 30.00),
+    "gpt-5.4": (2.50, 0.25, 15.00),
+    "gpt-5.3-codex": (1.75, 0.175, 14.00),
+    "gpt-5.2-codex": (1.75, 0.175, 14.00),
+    "gpt-5.1-codex-max": (1.25, 0.125, 10.00),
+    "gpt-5.1-codex": (1.25, 0.125, 10.00),
+    "gpt-5.1-codex-mini": (0.25, 0.025, 2.00),
+    "gpt-5-codex": (1.25, 0.125, 10.00),
+}
 OFFICIAL_CODEX_PRICING = {
-    "kind": "official_gpt54_rough",
+    "kind": "official_api_equivalent",
     "currency": "USD",
-    "label": "OpenAI official GPT-5.4 rough estimate",
-    "input_usd_per_million": 2.50,
-    "cached_input_usd_per_million": 0.25,
-    "output_usd_per_million": 15.00,
-    "assumed_input_share": 0.85,
-    "assumed_output_share": 0.15,
+    "label": "OpenAI API-equivalent estimate from measured token types",
+    "rates_updated_at": "2026-07-27",
     "notes": (
-        "Uses official GPT-5.4 API prices and a rough 85% input / 15% output mix. "
-        "Local Codex thread totals do not expose exact input/output/cached token splits."
+        "Uses official per-model API input, cached-input, and output prices. "
+        "This is not a Codex subscription invoice. Long-context uplifts, cache-write charges, "
+        "regional processing, tool fees, and tokens without a public model price are excluded."
     ),
 }
 REMOTE_CODEX_HOSTS = [
     {
         "host": "e122378.arm.com",
         "label": "Ubuntu desktop",
-    }
+    },
+    {
+        "host": "vscode-login3.hpc01.eu03.arm.com",
+        "fallback_hosts": ["vscode-login4.hpc01.eu03.arm.com"],
+        "display_host": "vscode-login3 + vscode-login4",
+        "label": "EU03 VS Code cluster (shared)",
+    },
 ]
 
 
@@ -77,6 +105,7 @@ def text_response(
     data = content.encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", content_type)
+    handler.send_header("Cache-Control", "no-cache")
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
     handler.wfile.write(data)
@@ -218,76 +247,380 @@ def remote_snapshot_file(host: str) -> Path:
 def run_remote_codex_snapshot(host_config):
     host = host_config["host"]
     label = host_config.get("label", host)
+    display_host = host_config.get("display_host", host)
+    query_hosts = [host] + list(host_config.get("fallback_hosts") or [])
     cache_path = remote_snapshot_file(host)
-    try:
-        completed = subprocess.run(
-            [
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                "-o",
-                "ConnectTimeout=8",
-                host,
-                f"python3 -c {shlex.quote(remote_query_script())}",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        payload = json.loads(completed.stdout.strip() or "{}")
+    errors = []
+    payload = None
+    queried_host = None
+    for candidate in query_hosts:
+        try:
+            completed = subprocess.run(
+                [
+                    "ssh",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
+                    "-o",
+                    "ConnectTimeout=8",
+                    candidate,
+                    f"python3 -c {shlex.quote(remote_query_script())}",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=35,
+            )
+            payload = json.loads(completed.stdout.strip() or "{}")
+            queried_host = candidate
+            break
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
+            stderr = getattr(exc, "stderr", "") or ""
+            errors.append(f"{candidate}: {stderr.strip() or str(exc)}")
+
+    if payload is not None:
         totals = payload.get("totals") or {}
         snapshot = {
-            "host": host,
+            "host": display_host,
+            "queried_host": queried_host,
+            "configured_hosts": query_hosts,
             "label": label,
             "status": payload.get("status", "configured"),
             "db_path": payload.get("db_path"),
             "thread_count": totals.get("thread_count", 0),
+            "raw_thread_count": totals.get("raw_thread_count", totals.get("thread_count", 0)),
+            "deduplicated_subagent_count": totals.get("deduplicated_subagent_count", 0),
             "total_tokens": totals.get("total_tokens", 0),
             "tokens_30d": totals.get("tokens_30d", 0),
             "tokens_7d": totals.get("tokens_7d", 0),
             "first_seen_local": format_local_timestamp(totals.get("first_seen")),
             "last_seen_local": format_local_timestamp(totals.get("last_seen")),
+            "token_usage": payload.get("token_usage", {}),
             "monthly": payload.get("monthly", []),
             "daily": payload.get("daily", []),
             "models": payload.get("models", []),
+            "model_months": payload.get("model_months", []),
             "cwds": payload.get("cwds", []),
             "fetched_at": utc_now(),
         }
         cache_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
         return snapshot
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
-        stderr = getattr(exc, "stderr", "") or ""
-        if cache_path.exists():
-            cached = json.loads(cache_path.read_text(encoding="utf-8"))
-            cached["status"] = "cached"
-            cached["cache_notice"] = tidy_title(
-                f"Live SSH refresh failed, showing cached snapshot instead. {stderr.strip() or str(exc)}",
-                limit=220,
-            )
-            return cached
-        return {
-            "host": host,
-            "label": label,
-            "status": "error",
-            "error": tidy_title(str(exc) if not stderr else stderr.strip(), limit=180),
-            "thread_count": None,
-            "total_tokens": None,
-            "tokens_30d": None,
-            "tokens_7d": None,
-            "monthly": [],
-            "daily": [],
-            "models": [],
-            "cwds": [],
-        }
+
+    error_text = " | ".join(errors)
+    if cache_path.exists():
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        cached["status"] = "cached"
+        cached["cache_notice"] = tidy_title(
+            f"Live SSH refresh failed, showing cached snapshot instead. {error_text}",
+            limit=220,
+        )
+        return cached
+    return {
+        "host": display_host,
+        "queried_host": None,
+        "configured_hosts": query_hosts,
+        "label": label,
+        "status": "error",
+        "error": tidy_title(error_text, limit=180),
+        "thread_count": None,
+        "total_tokens": None,
+        "tokens_30d": None,
+        "tokens_7d": None,
+        "monthly": [],
+        "daily": [],
+        "models": [],
+        "model_months": [],
+        "cwds": [],
+    }
 
 
 def remote_query_script() -> str:
     return r'''
-import json, os, sqlite3
+import json, os, re, sqlite3, time
+from datetime import datetime, timezone
 from pathlib import Path
+
+FIELDS = (
+  "total_tokens", "input_tokens", "cached_input_tokens", "uncached_input_tokens",
+  "output_tokens", "reasoning_output_tokens", "non_reasoning_output_tokens",
+  "unclassified_tokens",
+)
+
+def integer(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+def normalize(raw=None, fallback=0):
+    raw = raw or {}
+    input_tokens = integer(raw.get("input_tokens"))
+    cached_tokens = min(integer(raw.get("cached_input_tokens")), input_tokens)
+    output_tokens = integer(raw.get("output_tokens"))
+    reasoning_tokens = min(integer(raw.get("reasoning_output_tokens")), output_tokens)
+    total_tokens = integer(raw.get("total_tokens")) or integer(fallback)
+    typed = any(key in raw for key in (
+        "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens"
+    ))
+    classified = input_tokens + output_tokens if typed else 0
+    return {
+      "total_tokens": total_tokens,
+      "input_tokens": input_tokens,
+      "cached_input_tokens": cached_tokens,
+      "uncached_input_tokens": max(input_tokens - cached_tokens, 0),
+      "output_tokens": output_tokens,
+      "reasoning_output_tokens": reasoning_tokens,
+      "non_reasoning_output_tokens": max(output_tokens - reasoning_tokens, 0),
+      "unclassified_tokens": max(total_tokens - classified, 0),
+      "has_token_types": typed,
+    }
+
+def scale(raw, target):
+    target = max(integer(target), 0)
+    usage = normalize(raw, target)
+    if not usage["has_token_types"] or not usage["total_tokens"]:
+        return normalize(None, target)
+    ratio = target / usage["total_tokens"]
+    input_tokens = round(usage["input_tokens"] * ratio)
+    output_tokens = round(usage["output_tokens"] * ratio)
+    overflow = max(input_tokens + output_tokens - target, 0)
+    if overflow:
+        reduction = min(output_tokens, overflow)
+        output_tokens -= reduction
+        input_tokens -= overflow - reduction
+    return normalize({
+      "total_tokens": target,
+      "input_tokens": input_tokens,
+      "cached_input_tokens": min(round(usage["cached_input_tokens"] * ratio), input_tokens),
+      "output_tokens": output_tokens,
+      "reasoning_output_tokens": min(round(usage["reasoning_output_tokens"] * ratio), output_tokens),
+    })
+
+def latest(path):
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            remainder = b""
+            while position > 0:
+                size = min(65536, position)
+                position -= size
+                handle.seek(position)
+                lines = (handle.read(size) + remainder).split(b"\n")
+                remainder = lines[0] if position else b""
+                for line in reversed(lines[1:] if position else lines):
+                    if b'"token_count"' not in line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except Exception:
+                        continue
+                    payload = event.get("payload") or {}
+                    if event.get("type") == "event_msg" and payload.get("type") == "token_count":
+                        usage = (payload.get("info") or {}).get("total_token_usage")
+                        if isinstance(usage, dict):
+                            return normalize(usage)
+    except OSError:
+        return None
+    return None
+
+def local_day(value):
+    if not value:
+        return None
+    text = str(value).replace("+00:00", "Z")
+    for pattern in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            parsed = datetime.strptime(text, pattern).replace(tzinfo=timezone.utc)
+            return parsed.astimezone().strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+def counter_events(path):
+    events = []
+    if not path:
+        return events
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if '"token_count"' not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                payload = event.get("payload") or {}
+                usage = (payload.get("info") or {}).get("total_token_usage")
+                day = local_day(event.get("timestamp"))
+                if event.get("type") == "event_msg" and payload.get("type") == "token_count" and isinstance(usage, dict) and integer(usage.get("total_tokens")) > 0 and day:
+                    events.append({"day": day, "usage": normalize(usage)})
+    except OSError:
+        return []
+    return events
+
+def allocate_daily(events, target, fallback_day):
+    target = max(integer(target), 0)
+    if not target:
+        return []
+    segment_start = 0
+    previous_total = 0
+    for index, event in enumerate(events):
+        current_total = event["usage"]["total_tokens"]
+        if current_total < previous_total:
+            segment_start = index
+        previous_total = current_total
+    events = events[segment_start:]
+    previous = normalize(None, 0)
+    buckets = {}
+    for event in events:
+        current = event["usage"]
+        current_total = min(current["total_tokens"], target)
+        previous_total = min(previous["total_tokens"], target)
+        eligible = max(current_total - previous_total, 0)
+        if eligible:
+            interval = {
+              "total_tokens": max(current["total_tokens"] - previous["total_tokens"], 0),
+              "input_tokens": max(current["input_tokens"] - previous["input_tokens"], 0),
+              "cached_input_tokens": max(current["cached_input_tokens"] - previous["cached_input_tokens"], 0),
+              "output_tokens": max(current["output_tokens"] - previous["output_tokens"], 0),
+              "reasoning_output_tokens": max(current["reasoning_output_tokens"] - previous["reasoning_output_tokens"], 0),
+            }
+            usage = scale(interval, eligible)
+            bucket = buckets.setdefault(event["day"], {key: 0 for key in (
+              "total_tokens", "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens"
+            )})
+            for key in bucket:
+                bucket[key] += usage[key]
+        previous = current
+    if not buckets:
+        return [{"day": fallback_day, "usage": scale(events[-1]["usage"] if events else None, target)}]
+    raw_total = sum(bucket["total_tokens"] for bucket in buckets.values())
+    allocations = {}
+    fractions = []
+    allocated = 0
+    for day, bucket in buckets.items():
+        exact = target * bucket["total_tokens"] / raw_total
+        whole = int(exact)
+        allocations[day] = whole
+        allocated += whole
+        fractions.append((exact - whole, day))
+    for _, day in sorted(fractions, key=lambda item: (-item[0], item[1]))[:target - allocated]:
+        allocations[day] += 1
+    return [
+      {"day": day, "usage": scale(buckets[day], allocations[day])}
+      for day in sorted(buckets) if allocations[day] > 0
+    ]
+
+def rollout_daily(path, target, stamp):
+    fallback_day = time.strftime("%Y-%m-%d", time.localtime(stamp))
+    match = re.search(r"[/\\]sessions[/\\](\d{4})[/\\](\d{2})[/\\](\d{2})[/\\]", str(path or ""))
+    start_day = "-".join(match.groups()) if match else None
+    if start_day == fallback_day:
+        return [{"day": fallback_day, "usage": scale(latest(path), target)}]
+    return allocate_daily(counter_events(path), target, fallback_day)
+
+def aggregate(records):
+    totals = {key: 0 for key in FIELDS}
+    typed_threads = 0
+    for record in records:
+        usage = record["usage"]
+        for key in FIELDS:
+            totals[key] += integer(usage.get(key))
+        typed_threads += int(bool(usage.get("has_token_types")))
+    totals["thread_count"] = len(records)
+    totals["typed_thread_count"] = typed_threads
+    totals["detail_coverage_pct"] = 100.0 * typed_threads / len(records) if records else 0.0
+    return totals
+
+def grouped(records, key):
+    groups = {}
+    for record in records:
+        groups.setdefault(record[key], []).append(record)
+    result = []
+    for label, values in groups.items():
+        row = {key: label}
+        row.update(aggregate(values))
+        row["value"] = row["total_tokens"]
+        result.append(row)
+    return result
+
+def attach(base_rows, detail_rows, key):
+    details = {row[key]: row for row in detail_rows}
+    result = []
+    for base in base_rows:
+        row = dict(base)
+        detail = details.get(row.get(key))
+        if detail is None:
+            detail = normalize(None, row.get("value", 0))
+            detail.update(
+              thread_count=integer(row.get("thread_count")),
+              typed_thread_count=0,
+              detail_coverage_pct=0.0,
+            )
+        for field in FIELDS + ("typed_thread_count", "detail_coverage_pct"):
+            row[field] = detail.get(field, 0)
+        result.append(row)
+    return result
+
+def parent_id(row):
+    try:
+        source = json.loads(row.get("source") or "")
+    except (TypeError, ValueError):
+        return None
+    return (((source.get("subagent") or {}).get("thread_spawn") or {}).get("parent_thread_id"))
+
+def accounting_rows(rows):
+    by_id = {row["id"]: row for row in rows}
+    groups = {}
+    for row in rows:
+        current = row
+        seen = set()
+        while current and current["id"] not in seen:
+            seen.add(current["id"])
+            parent = by_id.get(parent_id(current))
+            if not parent:
+                break
+            current = parent
+        groups.setdefault(current["id"], []).append(row)
+    result = []
+    for root_id, members in groups.items():
+        root = by_id[root_id]
+        counter = max(members, key=lambda row: integer(row.get("tokens_used")))
+        representative = dict(root)
+        for key in ("tokens_used", "rollout_path", "updated_at"):
+            representative[key] = counter.get(key)
+        representative["tree_member_count"] = len(members)
+        result.append(representative)
+    return result
+
+def grouped_many(records, keys):
+    groups = {}
+    for record in records:
+        label = tuple(record.get(key) for key in keys)
+        groups.setdefault(label, []).append(record)
+    result = []
+    for label, values in groups.items():
+        row = dict(zip(keys, label))
+        row.update(aggregate(values))
+        result.append(row)
+    return result
+
+def monthly_records(records):
+    groups = {}
+    for record in records:
+        groups.setdefault((record["session_id"], record["day"][:7]), []).append(record)
+    result = []
+    for (_, month), values in groups.items():
+        result.append({
+          "month": month,
+          "model": values[0]["model"],
+          "cwd": values[0]["cwd"],
+          "usage": aggregate(values),
+        })
+    return result
 
 dbs = sorted(Path.home().glob('.codex/state_*.sqlite'))
 if not dbs:
@@ -295,69 +628,67 @@ if not dbs:
     raise SystemExit(0)
 
 db_path = str(dbs[-1])
-con = sqlite3.connect(db_path)
+db_uri = Path(db_path).resolve().as_uri() + '?mode=ro&immutable=1'
+con = sqlite3.connect(db_uri, uri=True)
 con.row_factory = sqlite3.Row
 cur = con.cursor()
-totals = dict(cur.execute("""
-SELECT
-  COUNT(*) AS thread_count,
-  COALESCE(SUM(tokens_used), 0) AS total_tokens,
-  COALESCE(SUM(CASE
-    WHEN updated_at >= strftime('%s', 'now', 'localtime', '-30 days')
-    THEN tokens_used ELSE 0 END), 0) AS tokens_30d,
-  COALESCE(SUM(CASE
-    WHEN updated_at >= strftime('%s', 'now', 'localtime', '-7 days')
-    THEN tokens_used ELSE 0 END), 0) AS tokens_7d,
-  MIN(updated_at) AS first_seen,
-  MAX(updated_at) AS last_seen
+raw_rows = [dict(r) for r in cur.execute("""
+SELECT id, source, COALESCE(model, '(unknown)') AS model, cwd,
+       tokens_used, rollout_path, updated_at
 FROM threads
-""").fetchone())
-monthly = [dict(r) for r in cur.execute("""
-SELECT
-  strftime('%Y-%m', updated_at, 'unixepoch', 'localtime') AS month,
-  COUNT(*) AS thread_count,
-  SUM(tokens_used) AS value
-FROM threads
-GROUP BY month
-ORDER BY month DESC
-LIMIT 12
 """).fetchall()]
-daily = [dict(r) for r in cur.execute("""
-SELECT
-  strftime('%Y-%m-%d', updated_at, 'unixepoch', 'localtime') AS day,
-  COUNT(*) AS thread_count,
-  SUM(tokens_used) AS value
-FROM threads
-GROUP BY day
-ORDER BY day ASC
-""").fetchall()]
-models = [dict(r) for r in cur.execute("""
-SELECT
-  COALESCE(model, '(unknown)') AS model,
-  COUNT(*) AS thread_count,
-  SUM(tokens_used) AS total_tokens
-FROM threads
-GROUP BY model
-ORDER BY total_tokens DESC
-LIMIT 6
-""").fetchall()]
-cwds = [dict(r) for r in cur.execute("""
-SELECT
-  cwd,
-  COUNT(*) AS thread_count,
-  SUM(tokens_used) AS total_tokens
-FROM threads
-GROUP BY cwd
-ORDER BY total_tokens DESC
-LIMIT 6
-""").fetchall()]
+detail_rows = accounting_rows(raw_rows)
+now = time.time()
+totals = {
+  "thread_count": len(detail_rows),
+  "raw_thread_count": len(raw_rows),
+  "deduplicated_subagent_count": len(raw_rows) - len(detail_rows),
+  "total_tokens": sum(integer(row.get("tokens_used")) for row in detail_rows),
+  "tokens_30d": 0,
+  "tokens_7d": 0,
+  "first_seen": min((integer(row.get("updated_at")) for row in detail_rows), default=None),
+  "last_seen": max((integer(row.get("updated_at")) for row in detail_rows), default=None),
+}
+records = []
+daily_records = []
+for row in detail_rows:
+    stamp = integer(row.get("updated_at"))
+    records.append({
+      "month": time.strftime("%Y-%m", time.localtime(stamp)),
+      "day": time.strftime("%Y-%m-%d", time.localtime(stamp)),
+      "model": row.get("model") or "(unknown)",
+      "cwd": row.get("cwd") or "(unknown)",
+      "usage": scale(latest(row.get("rollout_path")), row.get("tokens_used")),
+    })
+    for item in rollout_daily(row.get("rollout_path"), row.get("tokens_used"), stamp):
+        daily_records.append({
+          "session_id": row.get("id"),
+          "month": item["day"][:7],
+          "day": item["day"],
+          "model": row.get("model") or "(unknown)",
+          "cwd": row.get("cwd") or "(unknown)",
+          "usage": item["usage"],
+        })
+month_records = monthly_records(daily_records)
+cutoff_30 = time.strftime("%Y-%m-%d", time.localtime(now - 30 * 86400))
+cutoff_7 = time.strftime("%Y-%m-%d", time.localtime(now - 7 * 86400))
+totals["tokens_30d"] = sum(record["usage"]["total_tokens"] for record in daily_records if record["day"] >= cutoff_30)
+totals["tokens_7d"] = sum(record["usage"]["total_tokens"] for record in daily_records if record["day"] >= cutoff_7)
+token_usage = aggregate(records)
+monthly = sorted(grouped(month_records, "month"), key=lambda row: row["month"], reverse=True)[:12]
+daily = sorted(grouped(daily_records, "day"), key=lambda row: row["day"])
+models = sorted(grouped(records, "model"), key=lambda row: row["total_tokens"], reverse=True)
+cwds = sorted(grouped(records, "cwd"), key=lambda row: row["total_tokens"], reverse=True)[:6]
+model_months = grouped_many(month_records, ("month", "model"))
 print(json.dumps({
   "status": "configured",
   "db_path": db_path,
   "totals": totals,
+  "token_usage": token_usage,
   "monthly": monthly,
   "daily": daily,
   "models": models,
+  "model_months": model_months,
   "cwds": cwds,
 }))
 '''
@@ -379,7 +710,20 @@ def aggregate_monthly_series(series_list, key_name="month", value_name="value"):
             bucket = merged.setdefault(key, {"month": key, "value": 0, "thread_count": 0})
             bucket["value"] += row.get(value_name, 0) or 0
             bucket["thread_count"] += row.get("thread_count", 0) or 0
-    return sorted(merged.values(), key=month_key, reverse=True)
+            usage = normalize_token_usage(row, row.get(value_name, 0))
+            for field in TOKEN_TYPE_FIELDS:
+                bucket[field] = bucket.get(field, 0) + usage[field]
+            bucket["typed_thread_count"] = bucket.get("typed_thread_count", 0) + int(
+                row.get("typed_thread_count", 0) or 0
+            )
+    result = sorted(merged.values(), key=month_key, reverse=True)
+    for row in result:
+        row["detail_coverage_pct"] = (
+            round(100.0 * row["typed_thread_count"] / row["thread_count"], 2)
+            if row["thread_count"]
+            else 0.0
+        )
+    return result
 
 
 def aggregate_daily_series(series_list, key_name="day", value_name="value"):
@@ -390,7 +734,20 @@ def aggregate_daily_series(series_list, key_name="day", value_name="value"):
             bucket = merged.setdefault(key, {"day": key, "value": 0, "thread_count": 0})
             bucket["value"] += row.get(value_name, 0) or 0
             bucket["thread_count"] += row.get("thread_count", 0) or 0
-    return sorted(merged.values(), key=day_key)
+            usage = normalize_token_usage(row, row.get(value_name, 0))
+            for field in TOKEN_TYPE_FIELDS:
+                bucket[field] = bucket.get(field, 0) + usage[field]
+            bucket["typed_thread_count"] = bucket.get("typed_thread_count", 0) + int(
+                row.get("typed_thread_count", 0) or 0
+            )
+    result = sorted(merged.values(), key=day_key)
+    for row in result:
+        row["detail_coverage_pct"] = (
+            round(100.0 * row["typed_thread_count"] / row["thread_count"], 2)
+            if row["thread_count"]
+            else 0.0
+        )
+    return result
 
 
 def aggregate_named_rows(rows, label_key: str):
@@ -405,9 +762,36 @@ def aggregate_named_rows(rows, label_key: str):
         )
         bucket["thread_count"] += row.get("thread_count", 0) or 0
         bucket["total_tokens"] += row.get("total_tokens", 0) or 0
+        for field in TOKEN_TYPE_FIELDS[1:]:
+            bucket[field] = bucket.get(field, 0) + int(row.get(field, 0) or 0)
+        bucket["typed_thread_count"] = bucket.get("typed_thread_count", 0) + int(
+            row.get("typed_thread_count", 0) or 0
+        )
     result = sorted(merged.values(), key=lambda row: row["total_tokens"], reverse=True)
     for row in result:
         row["avg_tokens"] = round(row["total_tokens"] / row["thread_count"], 0) if row["thread_count"] else 0
+        row["detail_coverage_pct"] = (
+            round(100.0 * row["typed_thread_count"] / row["thread_count"], 2)
+            if row["thread_count"]
+            else 0.0
+        )
+    return result
+
+
+def merge_token_breakdown(rows, extra_rows, key_name: str, limit=None):
+    merged = {}
+    for row in list(rows or []) + list(extra_rows or []):
+        label = row.get(key_name)
+        if not label:
+            continue
+        bucket = merged.setdefault(label, {key_name: label, "thread_count": 0, "total_tokens": 0})
+        bucket["thread_count"] += row.get("thread_count", 0) or 0
+        bucket["total_tokens"] += row.get("total_tokens", 0) or 0
+    result = sorted(merged.values(), key=lambda row: row["total_tokens"], reverse=True)
+    for row in result:
+        row["avg_tokens"] = round(row["total_tokens"] / row["thread_count"], 0) if row["thread_count"] else 0
+    if limit:
+        return result[:limit]
     return result
 
 
@@ -490,47 +874,110 @@ def normalize_pricing(payload, derived=None):
     return pricing
 
 
-def build_cost_summary(total, monthly, pricing):
+def build_cost_summary(total, monthly, pricing, token_usage=None, models=None, model_months=None):
     if not pricing:
         return None
 
-    if pricing.get("kind") == "official_gpt54_rough":
-        input_rate = pricing["input_usd_per_million"]
-        output_rate = pricing["output_usd_per_million"]
-        cached_rate = pricing["cached_input_usd_per_million"]
-        assumed_rate = (
-            pricing["assumed_input_share"] * input_rate
-            + pricing["assumed_output_share"] * output_rate
-        )
-
-        def project(token_total, rate):
-            if token_total is None:
-                return None
-            return round(float(token_total) / 1_000_000.0 * float(rate), 2)
-
-        monthly_rows = []
-        for row in monthly or []:
-            monthly_rows.append(
-                {
-                    "month": row["month"],
-                    "rough_cost_usd": project(row["value"], assumed_rate),
-                    "input_only_cost_usd": project(row["value"], input_rate),
-                    "output_only_cost_usd": project(row["value"], output_rate),
-                    "cached_input_cost_usd": project(row["value"], cached_rate),
+    if pricing.get("kind") == "official_api_equivalent":
+        def price_row(row):
+            model = row.get("model") or row.get("label") or "(unknown)"
+            usage = normalize_token_usage(row, row.get("total_tokens", 0))
+            rates = OFFICIAL_MODEL_PRICING.get(model)
+            if not rates:
+                return {
+                    "model": model,
+                    "total_tokens": usage["total_tokens"],
+                    "priced_tokens": 0,
+                    "unpriced_tokens": usage["total_tokens"],
+                    "cost_usd": 0.0,
+                    "uncached_input_cost_usd": 0.0,
+                    "cached_input_cost_usd": 0.0,
+                    "output_cost_usd": 0.0,
+                    "rates": None,
                 }
+            input_rate, cached_rate, output_rate = rates
+            uncached_cost = usage["uncached_input_tokens"] / 1_000_000.0 * input_rate
+            cached_cost = usage["cached_input_tokens"] / 1_000_000.0 * cached_rate
+            output_cost = usage["output_tokens"] / 1_000_000.0 * output_rate
+            priced_tokens = (
+                usage["uncached_input_tokens"]
+                + usage["cached_input_tokens"]
+                + usage["output_tokens"]
+            )
+            return {
+                "model": model,
+                "total_tokens": usage["total_tokens"],
+                "priced_tokens": priced_tokens,
+                "unpriced_tokens": max(usage["total_tokens"] - priced_tokens, 0),
+                "cost_usd": uncached_cost + cached_cost + output_cost,
+                "uncached_input_cost_usd": uncached_cost,
+                "cached_input_cost_usd": cached_cost,
+                "output_cost_usd": output_cost,
+                "rates": {
+                    "input_usd_per_million": input_rate,
+                    "cached_input_usd_per_million": cached_rate,
+                    "output_usd_per_million": output_rate,
+                },
+            }
+
+        priced_models = [price_row(row) for row in (models or [])]
+        priced_tokens = sum(row["priced_tokens"] for row in priced_models)
+        unpriced_tokens = max(int(total or 0) - priced_tokens, 0)
+        total_cost = sum(row["cost_usd"] for row in priced_models)
+        cost_parts = {
+            "uncached_input_cost_usd": sum(row["uncached_input_cost_usd"] for row in priced_models),
+            "cached_input_cost_usd": sum(row["cached_input_cost_usd"] for row in priced_models),
+            "output_cost_usd": sum(row["output_cost_usd"] for row in priced_models),
+        }
+        monthly_costs = {}
+        for row in model_months or []:
+            priced = price_row(row)
+            month = row.get("month")
+            bucket = monthly_costs.setdefault(
+                month,
+                {"month": month, "api_equivalent_cost_usd": 0.0, "priced_tokens": 0, "total_tokens": 0},
+            )
+            bucket["api_equivalent_cost_usd"] += priced["cost_usd"]
+            bucket["priced_tokens"] += priced["priced_tokens"]
+            bucket["total_tokens"] += priced["total_tokens"]
+        monthly_rows = sorted(monthly_costs.values(), key=lambda row: row["month"], reverse=True)
+        for row in monthly_rows:
+            row["api_equivalent_cost_usd"] = round(row["api_equivalent_cost_usd"], 2)
+            row["pricing_coverage_pct"] = (
+                round(100.0 * row["priced_tokens"] / row["total_tokens"], 2)
+                if row["total_tokens"]
+                else 0.0
             )
 
+        for row in priced_models:
+            for key in (
+                "cost_usd",
+                "uncached_input_cost_usd",
+                "cached_input_cost_usd",
+                "output_cost_usd",
+            ):
+                row[key] = round(row[key], 2)
+        priced_models.sort(key=lambda row: row["cost_usd"], reverse=True)
         return {
             "currency": pricing["currency"],
             "label": pricing["label"],
             "kind": pricing["kind"],
             "notes": pricing.get("notes"),
-            "assumed_rate_per_million": assumed_rate,
-            "rough_cost_total_usd": project(total, assumed_rate),
-            "input_only_cost_total_usd": project(total, input_rate),
-            "output_only_cost_total_usd": project(total, output_rate),
-            "cached_input_cost_total_usd": project(total, cached_rate),
-            "latest_month_rough_cost_usd": monthly_rows[0]["rough_cost_usd"] if monthly_rows else None,
+            "rates_updated_at": pricing.get("rates_updated_at"),
+            "api_equivalent_cost_total_usd": round(total_cost, 2),
+            "latest_month_api_equivalent_cost_usd": (
+                monthly_rows[0]["api_equivalent_cost_usd"] if monthly_rows else None
+            ),
+            "priced_tokens": priced_tokens,
+            "unpriced_tokens": unpriced_tokens,
+            "pricing_coverage_pct": (
+                round(100.0 * priced_tokens / int(total or 0), 2) if total else 0.0
+            ),
+            "effective_rate_per_million": (
+                round(total_cost * 1_000_000.0 / priced_tokens, 4) if priced_tokens else None
+            ),
+            **{key: round(value, 2) for key, value in cost_parts.items()},
+            "model_rows": priced_models,
             "monthly_rows": monthly_rows,
         }
 
@@ -765,6 +1212,759 @@ def clear_codex_pricing():
         path.unlink()
 
 
+def parse_iso_datetime(value: str):
+    if not value:
+        return None
+    try:
+        normalized = str(value).replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+
+def iso_to_local_timestamp(value: str):
+    parsed = parse_iso_datetime(value)
+    if not parsed:
+        return None
+    return parsed.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def iso_to_local_epoch(value: str):
+    parsed = parse_iso_datetime(value)
+    if not parsed:
+        return None
+    return int(parsed.timestamp())
+
+
+def iso_to_local_day(value: str):
+    parsed = parse_iso_datetime(value)
+    if not parsed:
+        return None
+    return parsed.astimezone().strftime("%Y-%m-%d")
+
+
+def counter_int(counter, key: str) -> int:
+    try:
+        return int((counter or {}).get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalize_token_usage(raw=None, fallback_total=0):
+    raw = raw or {}
+    input_tokens = counter_int(raw, "input_tokens")
+    cached_input_tokens = counter_int(raw, "cached_input_tokens")
+    output_tokens = counter_int(raw, "output_tokens")
+    reasoning_output_tokens = counter_int(raw, "reasoning_output_tokens")
+    total_tokens = counter_int(raw, "total_tokens") or int(fallback_total or 0)
+    has_token_types = any(
+        key in raw
+        for key in (
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        )
+    )
+    classified_tokens = input_tokens + output_tokens if has_token_types else 0
+    return {
+        "total_tokens": total_tokens,
+        "input_tokens": input_tokens,
+        "cached_input_tokens": min(cached_input_tokens, input_tokens),
+        "uncached_input_tokens": max(input_tokens - cached_input_tokens, 0),
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": min(reasoning_output_tokens, output_tokens),
+        "non_reasoning_output_tokens": max(output_tokens - reasoning_output_tokens, 0),
+        "unclassified_tokens": max(total_tokens - classified_tokens, 0),
+        "has_token_types": has_token_types,
+    }
+
+
+def scale_token_usage(raw, target_total):
+    target_total = max(int(target_total or 0), 0)
+    usage = normalize_token_usage(raw, target_total)
+    if not usage["has_token_types"] or not usage["total_tokens"]:
+        return normalize_token_usage(None, target_total)
+
+    ratio = target_total / usage["total_tokens"]
+    input_tokens = round(usage["input_tokens"] * ratio)
+    output_tokens = round(usage["output_tokens"] * ratio)
+    overflow = max(input_tokens + output_tokens - target_total, 0)
+    if overflow:
+        output_reduction = min(output_tokens, overflow)
+        output_tokens -= output_reduction
+        input_tokens -= overflow - output_reduction
+    cached_input_tokens = min(round(usage["cached_input_tokens"] * ratio), input_tokens)
+    reasoning_output_tokens = min(round(usage["reasoning_output_tokens"] * ratio), output_tokens)
+    return normalize_token_usage(
+        {
+            "total_tokens": target_total,
+            "input_tokens": input_tokens,
+            "cached_input_tokens": cached_input_tokens,
+            "output_tokens": output_tokens,
+            "reasoning_output_tokens": reasoning_output_tokens,
+        }
+    )
+
+
+def latest_rollout_usage(path: str):
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            remainder = b""
+            while position > 0:
+                size = min(64 * 1024, position)
+                position -= size
+                handle.seek(position)
+                lines = (handle.read(size) + remainder).split(b"\n")
+                remainder = lines[0] if position else b""
+                candidates = lines[1:] if position else lines
+                for line in reversed(candidates):
+                    if b'"token_count"' not in line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    payload = event.get("payload") or {}
+                    if event.get("type") != "event_msg" or payload.get("type") != "token_count":
+                        continue
+                    usage = (payload.get("info") or {}).get("total_token_usage")
+                    if isinstance(usage, dict):
+                        return normalize_token_usage(usage)
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def rollout_counter_events(path: str):
+    events = []
+    if not path:
+        return events
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if '"token_count"' not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = event.get("payload") or {}
+                if event.get("type") != "event_msg" or payload.get("type") != "token_count":
+                    continue
+                usage = (payload.get("info") or {}).get("total_token_usage")
+                timestamp = event.get("timestamp")
+                if isinstance(usage, dict) and counter_int(usage, "total_tokens") > 0 and timestamp:
+                    events.append({"timestamp": timestamp, "usage": normalize_token_usage(usage)})
+    except OSError:
+        return []
+    return events
+
+
+def allocate_daily_counter_usage(events, target_total, baseline_total=0, fallback_day=None):
+    target_total = max(int(target_total or 0), 0)
+    baseline_total = max(int(baseline_total or 0), 0)
+    if target_total <= 0:
+        return []
+
+    normalized_events = []
+    for event in events or []:
+        day = iso_to_local_day(event.get("timestamp"))
+        usage = normalize_token_usage(event.get("usage"))
+        if day and usage["total_tokens"] > 0:
+            normalized_events.append({"day": day, "usage": usage})
+
+    # A decreasing absolute counter starts a new counter segment. The final
+    # segment is authoritative because SQLite and snapshot totals track it.
+    segment_start = 0
+    previous_total = 0
+    for index, event in enumerate(normalized_events):
+        current_total = event["usage"]["total_tokens"]
+        if current_total < previous_total:
+            segment_start = index
+        previous_total = current_total
+    normalized_events = normalized_events[segment_start:]
+
+    upper_total = baseline_total + target_total
+    previous = normalize_token_usage(None, 0)
+    buckets = {}
+    for event in normalized_events:
+        current = event["usage"]
+        previous_total = previous["total_tokens"]
+        current_total = current["total_tokens"]
+        if current_total < previous_total:
+            previous = normalize_token_usage(None, 0)
+            previous_total = 0
+        overlap_start = max(previous_total, baseline_total)
+        overlap_end = min(current_total, upper_total)
+        eligible_total = max(overlap_end - overlap_start, 0)
+        if eligible_total:
+            interval_total = max(current_total - previous_total, 0)
+            interval_usage = {
+                "total_tokens": interval_total,
+                "input_tokens": max(current["input_tokens"] - previous["input_tokens"], 0),
+                "cached_input_tokens": max(
+                    current["cached_input_tokens"] - previous["cached_input_tokens"], 0
+                ),
+                "output_tokens": max(current["output_tokens"] - previous["output_tokens"], 0),
+                "reasoning_output_tokens": max(
+                    current["reasoning_output_tokens"] - previous["reasoning_output_tokens"], 0
+                ),
+            }
+            usage = scale_token_usage(interval_usage, eligible_total)
+            bucket = buckets.setdefault(
+                event["day"],
+                {
+                    "total_tokens": 0,
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 0,
+                    "reasoning_output_tokens": 0,
+                },
+            )
+            for field in bucket:
+                bucket[field] += usage[field]
+        previous = current
+
+    if not buckets:
+        if not fallback_day:
+            return []
+        latest = normalized_events[-1]["usage"] if normalized_events else None
+        return [{"day": fallback_day, "usage": scale_token_usage(latest, target_total)}]
+
+    raw_total = sum(bucket["total_tokens"] for bucket in buckets.values())
+    allocations = {}
+    fractions = []
+    allocated = 0
+    for day, bucket in buckets.items():
+        exact = target_total * bucket["total_tokens"] / raw_total
+        whole = int(exact)
+        allocations[day] = whole
+        allocated += whole
+        fractions.append((exact - whole, day))
+    for _, day in sorted(fractions, key=lambda item: (-item[0], item[1]))[: target_total - allocated]:
+        allocations[day] += 1
+
+    return [
+        {"day": day, "usage": scale_token_usage(buckets[day], allocations[day])}
+        for day in sorted(buckets)
+        if allocations[day] > 0
+    ]
+
+
+def rollout_start_day(path: str):
+    match = re.search(r"[/\\]sessions[/\\](\d{4})[/\\](\d{2})[/\\](\d{2})[/\\]", str(path or ""))
+    return "-".join(match.groups()) if match else None
+
+
+def rollout_daily_usage(path: str, target_total, baseline_total=0, fallback_epoch=None):
+    fallback_day = None
+    if fallback_epoch:
+        fallback_day = datetime.fromtimestamp(int(fallback_epoch)).astimezone().strftime("%Y-%m-%d")
+    if rollout_start_day(path) == fallback_day and baseline_total == 0:
+        return [
+            {
+                "day": fallback_day,
+                "usage": scale_token_usage(latest_rollout_usage(path), target_total),
+            }
+        ]
+    return allocate_daily_counter_usage(
+        rollout_counter_events(path),
+        target_total,
+        baseline_total=baseline_total,
+        fallback_day=fallback_day,
+    )
+
+
+def monthly_usage_records(daily_records):
+    monthly = []
+    grouped = {}
+    for record in daily_records:
+        month = record["day"][:7]
+        grouped.setdefault(month, []).append(record)
+    for month, records in grouped.items():
+        monthly.append(
+            {
+                "month": month,
+                "model": records[0].get("model") or "(unknown)",
+                "thread_count": records[0].get("thread_count", 1),
+                "usage": aggregate_token_usage(records),
+            }
+        )
+    return monthly
+
+
+def aggregate_token_usage(records):
+    totals = {key: 0 for key in TOKEN_TYPE_FIELDS}
+    thread_count = 0
+    typed_thread_count = 0
+    for record in records:
+        usage = record.get("usage") or normalize_token_usage(None, record.get("tokens_used", 0))
+        for key in TOKEN_TYPE_FIELDS:
+            totals[key] += counter_int(usage, key)
+        record_threads = int(record.get("thread_count", 1) or 0)
+        thread_count += record_threads
+        if usage.get("has_token_types"):
+            typed_thread_count += record_threads
+    totals["thread_count"] = thread_count
+    totals["typed_thread_count"] = typed_thread_count
+    totals["detail_coverage_pct"] = (
+        round(100.0 * typed_thread_count / thread_count, 2) if thread_count else 0.0
+    )
+    return totals
+
+
+def grouped_token_usage(records, key: str, reverse=False):
+    grouped = {}
+    for record in records:
+        label = record.get(key)
+        if not label:
+            continue
+        grouped.setdefault(label, []).append(record)
+    result = []
+    for label, values in grouped.items():
+        row = {key: label}
+        row.update(aggregate_token_usage(values))
+        row["value"] = row["total_tokens"]
+        result.append(row)
+    return sorted(result, key=lambda row: row[key], reverse=reverse)
+
+
+def grouped_model_month_usage(records):
+    grouped = {}
+    for record in records:
+        model = record.get("model") or "(unknown)"
+        month = record.get("month")
+        if not month:
+            continue
+        grouped.setdefault((month, model), []).append(record)
+    result = []
+    for (month, model), values in grouped.items():
+        row = {"month": month, "model": model}
+        row.update(aggregate_token_usage(values))
+        result.append(row)
+    return sorted(result, key=lambda row: (row["month"], row["model"]), reverse=True)
+
+
+def attach_token_usage(base_rows, detail_rows, key: str):
+    details = {row[key]: row for row in detail_rows}
+    attached = []
+    for base in base_rows:
+        row = dict(base)
+        detail = details.get(row.get(key))
+        if detail is None:
+            detail = aggregate_token_usage(
+                [
+                    {
+                        "thread_count": row.get("thread_count", 0),
+                        "usage": normalize_token_usage(None, row.get("value", 0)),
+                    }
+                ]
+            )
+        for field in TOKEN_TYPE_FIELDS + ("typed_thread_count", "detail_coverage_pct"):
+            row[field] = detail.get(field, 0)
+        attached.append(row)
+    return attached
+
+
+def combine_token_usage_summaries(summaries):
+    totals = {key: 0 for key in TOKEN_TYPE_FIELDS}
+    thread_count = 0
+    typed_thread_count = 0
+    for summary in summaries:
+        summary = summary or {}
+        usage = normalize_token_usage(summary, summary.get("total_tokens", 0))
+        for key in TOKEN_TYPE_FIELDS:
+            totals[key] += counter_int(usage, key)
+        thread_count += int(summary.get("thread_count", 0) or 0)
+        typed_thread_count += int(summary.get("typed_thread_count", 0) or 0)
+    totals["thread_count"] = thread_count
+    totals["typed_thread_count"] = typed_thread_count
+    totals["detail_coverage_pct"] = (
+        round(100.0 * typed_thread_count / thread_count, 2) if thread_count else 0.0
+    )
+    return totals
+
+
+def token_usage_or_unclassified(summary, total_tokens, thread_count):
+    if summary:
+        return summary
+    usage = normalize_token_usage(None, total_tokens)
+    usage["thread_count"] = int(thread_count or 0)
+    usage["typed_thread_count"] = 0
+    usage["detail_coverage_pct"] = 0.0
+    return usage
+
+
+def app_session_from_rollout(path: Path):
+    meta = {}
+    last_counter = None
+    last_counter_at = None
+    token_event_count = 0
+    counter_events = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if '"session_meta"' not in line and '"token_count"' not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "session_meta":
+                    payload = event.get("payload") or {}
+                    meta = {
+                        "id": payload.get("id"),
+                        "cwd": payload.get("cwd"),
+                        "originator": payload.get("originator"),
+                        "source": payload.get("source"),
+                        "thread_source": payload.get("thread_source"),
+                        "cli_version": payload.get("cli_version"),
+                        "model_provider": payload.get("model_provider"),
+                        "created_at": payload.get("timestamp") or event.get("timestamp"),
+                    }
+                    continue
+                payload = event.get("payload") or {}
+                if payload.get("type") != "token_count":
+                    continue
+                usage = ((payload.get("info") or {}).get("total_token_usage")) or {}
+                total = counter_int(usage, "total_tokens")
+                if total <= 0:
+                    continue
+                token_event_count += 1
+                last_counter = {
+                    "input_tokens": counter_int(usage, "input_tokens"),
+                    "cached_input_tokens": counter_int(usage, "cached_input_tokens"),
+                    "output_tokens": counter_int(usage, "output_tokens"),
+                    "reasoning_output_tokens": counter_int(usage, "reasoning_output_tokens"),
+                    "total_tokens": total,
+                }
+                last_counter_at = event.get("timestamp")
+                counter_events.append({"timestamp": last_counter_at, "usage": last_counter})
+    except OSError:
+        return None
+
+    if not last_counter:
+        return None
+
+    originator = str(meta.get("originator") or "")
+    source = str(meta.get("source") or "")
+    if originator != "Codex Desktop" and not (not originator and source == "vscode"):
+        return None
+
+    captured_at = last_counter_at or meta.get("created_at")
+    day = iso_to_local_day(captured_at)
+    if not day:
+        return None
+
+    session_id = meta.get("id") or path.stem
+    cwd = meta.get("cwd") or "(unknown)"
+    return {
+        "session_id": session_id,
+        "rollout_path": str(path),
+        "cwd": cwd,
+        "originator": originator or "Codex Desktop",
+        "source": source or "vscode",
+        "thread_source": meta.get("thread_source") or "(unknown)",
+        "model_provider": meta.get("model_provider") or "openai",
+        "cli_version": meta.get("cli_version") or "",
+        "created_at": meta.get("created_at"),
+        "captured_at": captured_at,
+        "captured_local": iso_to_local_timestamp(captured_at),
+        "captured_epoch": iso_to_local_epoch(captured_at),
+        "day": day,
+        "month": day[:7],
+        "counter": last_counter,
+        "counter_events": counter_events,
+        "token_event_count": token_event_count,
+    }
+
+
+def load_codex_app_source(indexed_rollouts=None):
+    indexed_rollouts = indexed_rollouts or {}
+    if not CODEX_SESSIONS_DIR.exists():
+        return {
+            "status": "missing",
+            "ingestion": "automatic-codex-app-jsonl",
+            "notes": "No ~/.codex/sessions directory was found.",
+            "total": 0,
+            "last_30_days": 0,
+            "last_7_days": 0,
+            "thread_count": 0,
+            "monthly": [],
+            "daily": [],
+            "daily_30": [],
+            "model_breakdown": [],
+            "cwd_breakdown": [],
+            "source_breakdown": [],
+            "top_threads": [],
+            "recent_threads": [],
+            "thread_tokens": [],
+            "all_session_count": 0,
+            "included_session_count": 0,
+            "indexed_session_count": 0,
+            "_detail_records": [],
+        }
+
+    cutoff_30 = datetime.now().astimezone() - timedelta(days=30)
+    cutoff_7 = datetime.now().astimezone() - timedelta(days=7)
+    discovered = []
+    included_rows = []
+    indexed_session_count = 0
+    indexed_delta_session_count = 0
+
+    for path in sorted(CODEX_SESSIONS_DIR.glob("**/rollout-*.jsonl")):
+        session = app_session_from_rollout(path)
+        if not session:
+            continue
+        discovered.append(session)
+        existing_tokens = indexed_rollouts.get(session["rollout_path"])
+        total_tokens = session["counter"]["total_tokens"]
+        tokens_to_add = total_tokens if existing_tokens is None else max(0, total_tokens - existing_tokens)
+        if existing_tokens is not None:
+            indexed_session_count += 1
+            if tokens_to_add:
+                indexed_delta_session_count += 1
+        if tokens_to_add <= 0:
+            continue
+        counted_as_thread = existing_tokens is None
+        included_rows.append(
+            {
+                **session,
+                "tokens_used": tokens_to_add,
+                "counted_as_thread": counted_as_thread,
+                "thread_count": 1 if counted_as_thread else 0,
+                "indexed_tokens": existing_tokens or 0,
+                "daily_usage": allocate_daily_counter_usage(
+                    session["counter_events"],
+                    tokens_to_add,
+                    baseline_total=existing_tokens or 0,
+                    fallback_day=session["day"],
+                ),
+            }
+        )
+
+    daily_detail_records = []
+    monthly_detail_records = []
+    for row in included_rows:
+        session_daily_records = [
+            {
+                "day": item["day"],
+                "month": item["day"][:7],
+                "model": "(codex app counter)",
+                "thread_count": row["thread_count"],
+                "usage": item["usage"],
+            }
+            for item in row["daily_usage"]
+        ]
+        daily_detail_records.extend(session_daily_records)
+        monthly_detail_records.extend(monthly_usage_records(session_daily_records))
+
+    monthly = grouped_token_usage(monthly_detail_records, "month", reverse=True)
+    for row in monthly:
+        row["avg_tokens"] = round(row["value"] / row["thread_count"], 0) if row["thread_count"] else 0
+    daily = grouped_token_usage(daily_detail_records, "day")
+    daily_30_cutoff = cutoff_30.strftime("%Y-%m-%d")
+    daily_30 = [row for row in daily if row["day"] >= daily_30_cutoff]
+    app_thread_count = sum(row["thread_count"] for row in included_rows)
+    app_total = sum(row["tokens_used"] for row in included_rows)
+    model_breakdown = [
+        {
+            "model": "(codex app counter)",
+            "thread_count": app_thread_count,
+            "total_tokens": app_total,
+            "avg_tokens": round(
+                app_total
+                / app_thread_count,
+                0,
+            )
+            if app_thread_count
+            else 0,
+        }
+    ] if included_rows else []
+    effort_breakdown = [
+        {
+            "reasoning_effort": "(codex app counter)",
+            "thread_count": app_thread_count,
+            "total_tokens": app_total,
+        }
+    ] if included_rows else []
+    approval_breakdown = [
+        {
+            "approval_mode": "(codex app counter)",
+            "thread_count": app_thread_count,
+            "total_tokens": app_total,
+        }
+    ] if included_rows else []
+    sandbox_breakdown = [
+        {
+            "sandbox_policy": "(codex app counter)",
+            "thread_count": app_thread_count,
+            "total_tokens": app_total,
+        }
+    ] if included_rows else []
+    cwd_breakdown = summarize_app_group(included_rows, "cwd", "cwd")
+    source_breakdown = summarize_app_group(included_rows, "Codex App", "label")
+
+    app_threads = [
+        {
+            "title": "Codex App session",
+            "cwd": row["cwd"],
+            "model_provider": row["model_provider"],
+            "model": "(codex app counter)",
+            "reasoning_effort": "(counter snapshot)",
+            "approval_mode": row["thread_source"],
+            "tokens_used": row["tokens_used"],
+            "updated_at": row["captured_epoch"] or 0,
+            "rollout_path": row["rollout_path"],
+            "counted_as_thread": row["counted_as_thread"],
+        }
+        for row in included_rows
+    ]
+    app_threads.sort(key=lambda row: row["tokens_used"], reverse=True)
+    recent_threads = sorted(app_threads, key=lambda row: row["updated_at"], reverse=True)
+    thread_tokens = [row["tokens_used"] for row in included_rows if row["counted_as_thread"]]
+    total = app_total
+    first_seen = min((row["captured_epoch"] for row in included_rows if row["captured_epoch"]), default=None)
+    last_seen = max((row["captured_epoch"] for row in included_rows if row["captured_epoch"]), default=None)
+
+    cutoff_7_day = cutoff_7.strftime("%Y-%m-%d")
+    last_30_days = sum(row["value"] for row in daily if row["day"] >= daily_30_cutoff)
+    last_7_days = sum(row["value"] for row in daily if row["day"] >= cutoff_7_day)
+
+    snapshot_sessions = []
+    for row in discovered:
+        existing_tokens = indexed_rollouts.get(row["rollout_path"])
+        total_tokens = row["counter"]["total_tokens"]
+        tokens_included = total_tokens if existing_tokens is None else max(0, total_tokens - existing_tokens)
+        snapshot_sessions.append(
+            {
+                "session_id": row["session_id"],
+                "rollout_path": row["rollout_path"],
+                "captured_at": row["captured_at"],
+                "cwd": row["cwd"],
+                "counter": row["counter"],
+                "tokens_included": tokens_included,
+                "indexed_tokens": existing_tokens or 0,
+                "counted_as_thread": existing_tokens is None and tokens_included > 0,
+            }
+        )
+
+    snapshot = {
+        "captured_at": utc_now(),
+        "sessions_dir": str(CODEX_SESSIONS_DIR),
+        "all_session_count": len(discovered),
+        "included_session_count": len(included_rows),
+        "indexed_session_count": indexed_session_count,
+        "indexed_delta_session_count": indexed_delta_session_count,
+        "included_total_tokens": total,
+        "sessions": snapshot_sessions,
+    }
+    snapshot_error = None
+    try:
+        DATA_DIR.mkdir(exist_ok=True)
+        CODEX_APP_SNAPSHOT_FILE.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+    except OSError as exc:
+        snapshot_error = str(exc)
+
+    notes = [
+        f"Read Codex App token_count counters from {CODEX_SESSIONS_DIR}.",
+        f"Added {len(included_rows)} sessions not fully represented in local SQLite.",
+    ]
+    if indexed_session_count:
+        notes.append(f"Skipped or delta-adjusted {indexed_session_count} App sessions already indexed by threads.rollout_path.")
+    if snapshot_error:
+        notes.append(f"Could not write generated app snapshot: {snapshot_error}.")
+
+    detail_records = [
+        {
+            "month": row["month"],
+            "day": row["day"],
+            "model": row.get("model") or "(unknown)",
+            "thread_count": row["thread_count"],
+            "usage": scale_token_usage(row["counter"], row["tokens_used"]),
+        }
+        for row in included_rows
+    ]
+
+    return {
+        "status": "configured",
+        "ingestion": "automatic-codex-app-jsonl",
+        "label": "Codex App rollout counters",
+        "metric": "tokens",
+        "unit": "tokens",
+        "total": total,
+        "last_30_days": last_30_days,
+        "last_7_days": last_7_days,
+        "thread_count": sum(row["thread_count"] for row in included_rows),
+        "first_seen": first_seen,
+        "last_seen": last_seen,
+        "monthly": monthly,
+        "daily": daily,
+        "daily_30": daily_30,
+        "model_breakdown": model_breakdown,
+        "effort_breakdown": effort_breakdown,
+        "cwd_breakdown": cwd_breakdown,
+        "source_breakdown": source_breakdown,
+        "approval_breakdown": approval_breakdown,
+        "sandbox_breakdown": sandbox_breakdown,
+        "top_threads": app_threads[:8],
+        "recent_threads": recent_threads[:8],
+        "thread_tokens": thread_tokens,
+        "all_session_count": len(discovered),
+        "included_session_count": len(included_rows),
+        "indexed_session_count": indexed_session_count,
+        "indexed_delta_session_count": indexed_delta_session_count,
+        "snapshot_path": str(CODEX_APP_SNAPSHOT_FILE),
+        "snapshot_error": snapshot_error,
+        "_detail_records": detail_records,
+        "_daily_detail_records": daily_detail_records,
+        "_monthly_detail_records": monthly_detail_records,
+        "notes": " ".join(notes),
+    }
+
+
+def aggregate_daily_or_monthly(rows, key: str):
+    merged = {}
+    for row in rows:
+        label = row.get(key)
+        if not label:
+            continue
+        bucket = merged.setdefault(label, {key: label, "value": 0, "thread_count": 0})
+        bucket["value"] += row.get("tokens_used", 0) or 0
+        bucket["thread_count"] += row.get("thread_count", 0) or 0
+    sort_key = month_key if key == "month" else day_key
+    normalized = sorted(merged.values(), key=sort_key, reverse=(key == "month"))
+    if key == "month":
+        for row in normalized:
+            row["avg_tokens"] = round(row["value"] / row["thread_count"], 0) if row["thread_count"] else 0
+    return normalized
+
+
+def summarize_app_group(rows, value, output_key: str):
+    if not rows:
+        return []
+    merged = {}
+    for row in rows:
+        label = row.get(value) if output_key != "label" else value
+        if not label:
+            continue
+        bucket = merged.setdefault(label, {output_key: label, "thread_count": 0, "total_tokens": 0})
+        bucket["thread_count"] += row.get("thread_count", 0) or 0
+        bucket["total_tokens"] += row.get("tokens_used", 0) or 0
+    result = sorted(merged.values(), key=lambda row: row["total_tokens"], reverse=True)
+    for row in result:
+        row["avg_tokens"] = round(row["total_tokens"] / row["thread_count"], 0) if row["thread_count"] else 0
+    return result[:8]
+
+
 def load_codex_source():
     db_paths = sorted(glob.glob(str(HOME / ".codex" / "state_*.sqlite")))
     if not db_paths:
@@ -794,7 +1994,7 @@ def load_codex_source():
     connection.row_factory = sqlite3.Row
     cursor = connection.cursor()
 
-    totals = cursor.execute(
+    totals = dict(cursor.execute(
         """
         SELECT
           COUNT(*) AS thread_count,
@@ -810,7 +2010,7 @@ def load_codex_source():
           COUNT(DISTINCT strftime('%Y-%m-%d', updated_at, 'unixepoch', 'localtime')) AS active_days_total
         FROM threads
         """
-    ).fetchone()
+    ).fetchone())
 
     monthly = fetch_all_dicts(
         cursor,
@@ -984,6 +2184,20 @@ def load_codex_source():
     )
 
     thread_tokens = [row["tokens_used"] for row in fetch_all_dicts(cursor, "SELECT tokens_used FROM threads")]
+    detail_thread_rows = fetch_all_dicts(
+        cursor,
+        """
+        SELECT tokens_used, rollout_path, updated_at, COALESCE(model, '(unknown)') AS model
+        FROM threads
+        """,
+    )
+    indexed_rollouts = {
+        row["rollout_path"]: int(row["tokens_used"] or 0)
+        for row in fetch_all_dicts(
+            cursor,
+            "SELECT rollout_path, tokens_used FROM threads WHERE rollout_path IS NOT NULL AND rollout_path <> ''",
+        )
+    }
 
     if table_exists(cursor, "logs"):
         response_events = cursor.execute(
@@ -1004,12 +2218,131 @@ def load_codex_source():
 
     connection.close()
 
+    detail_records = []
+    daily_detail_records = []
+    monthly_detail_records = []
+    for row in detail_thread_rows:
+        updated_at = int(row.get("updated_at") or 0)
+        local_time = datetime.fromtimestamp(updated_at).astimezone()
+        tokens_used = int(row.get("tokens_used") or 0)
+        rollout_usage = latest_rollout_usage(row.get("rollout_path"))
+        detail_records.append(
+            {
+                "month": local_time.strftime("%Y-%m"),
+                "day": local_time.strftime("%Y-%m-%d"),
+                "model": row.get("model") or "(unknown)",
+                "thread_count": 1,
+                "usage": scale_token_usage(rollout_usage, tokens_used),
+            }
+        )
+        thread_daily_records = [
+            {
+                "month": item["day"][:7],
+                "day": item["day"],
+                "model": row.get("model") or "(unknown)",
+                "thread_count": 1,
+                "usage": item["usage"],
+            }
+            for item in rollout_daily_usage(
+                row.get("rollout_path"),
+                tokens_used,
+                fallback_epoch=updated_at,
+            )
+        ]
+        daily_detail_records.extend(thread_daily_records)
+        monthly_detail_records.extend(monthly_usage_records(thread_daily_records))
+
+    app_source = load_codex_app_source(indexed_rollouts)
+    detail_records.extend(app_source.pop("_detail_records", []))
+    daily_detail_records.extend(app_source.pop("_daily_detail_records", []))
+    monthly_detail_records.extend(app_source.pop("_monthly_detail_records", []))
+    app_total = app_source.get("total", 0) or 0
+    if app_total:
+        totals["total_tokens"] += app_total
+        totals["tokens_30d"] += app_source.get("last_30_days", 0) or 0
+        totals["tokens_7d"] += app_source.get("last_7_days", 0) or 0
+        totals["thread_count"] += app_source.get("thread_count", 0) or 0
+        app_first_seen = app_source.get("first_seen")
+        app_last_seen = app_source.get("last_seen")
+        if app_first_seen is not None:
+            totals["first_seen"] = min(
+                value for value in [totals.get("first_seen"), app_first_seen] if value is not None
+            )
+        if app_last_seen is not None:
+            totals["last_seen"] = max(
+                value for value in [totals.get("last_seen"), app_last_seen] if value is not None
+            )
+        model_breakdown = merge_token_breakdown(
+            model_breakdown,
+            app_source.get("model_breakdown", []),
+            "model",
+            limit=8,
+        )
+        effort_breakdown = merge_token_breakdown(
+            effort_breakdown,
+            app_source.get("effort_breakdown", []),
+            "reasoning_effort",
+        )
+        cwd_breakdown = merge_token_breakdown(
+            cwd_breakdown,
+            app_source.get("cwd_breakdown", []),
+            "cwd",
+            limit=8,
+        )
+        source_breakdown = merge_token_breakdown(
+            source_breakdown,
+            app_source.get("source_breakdown", []),
+            "label",
+        )
+        approval_breakdown = merge_token_breakdown(
+            approval_breakdown,
+            app_source.get("approval_breakdown", []),
+            "approval_mode",
+        )
+        sandbox_breakdown = merge_token_breakdown(
+            sandbox_breakdown,
+            app_source.get("sandbox_breakdown", []),
+            "sandbox_policy",
+            limit=6,
+        )
+        top_threads = sorted(
+            top_threads + app_source.get("top_threads", []),
+            key=lambda row: row.get("tokens_used", 0) or 0,
+            reverse=True,
+        )[:8]
+        recent_threads = sorted(
+            recent_threads + app_source.get("recent_threads", []),
+            key=lambda row: row.get("updated_at", 0) or 0,
+            reverse=True,
+        )[:8]
+        thread_tokens.extend(app_source.get("thread_tokens", []))
+
+    token_usage = aggregate_token_usage(detail_records)
+    model_breakdown = grouped_token_usage(detail_records, "model")
+    for row in model_breakdown:
+        row["avg_tokens"] = (
+            round(row["total_tokens"] / row["thread_count"], 0) if row["thread_count"] else 0
+        )
+    model_breakdown.sort(key=lambda row: row["total_tokens"], reverse=True)
+    model_months = grouped_model_month_usage(monthly_detail_records)
+    monthly = grouped_token_usage(monthly_detail_records, "month", reverse=True)
+    for row in monthly:
+        row["avg_tokens"] = round(row["value"] / row["thread_count"], 0) if row["thread_count"] else 0
+    daily = grouped_token_usage(daily_detail_records, "day")
+    cutoff_30_day = (datetime.now().astimezone() - timedelta(days=30)).strftime("%Y-%m-%d")
+    cutoff_7_day = (datetime.now().astimezone() - timedelta(days=7)).strftime("%Y-%m-%d")
+    daily_30 = [row for row in daily if row["day"] >= cutoff_30_day]
+    totals["tokens_30d"] = sum(row["value"] for row in daily_30)
+    totals["tokens_7d"] = sum(row["value"] for row in daily if row["day"] >= cutoff_7_day)
+    totals["active_days_total"] = len([row for row in daily if row.get("value", 0)])
+
     total_tokens = totals["total_tokens"]
     for row in monthly:
         row["share_pct"] = share_pct(row["value"], total_tokens)
     for row in daily_30:
         row["share_pct_30d"] = share_pct(row["value"], totals["tokens_30d"])
     for row in model_breakdown:
+        row["label"] = row.get("model")
         row["share_pct"] = share_pct(row["total_tokens"], total_tokens)
     for row in effort_breakdown:
         row["share_pct"] = share_pct(row["total_tokens"], total_tokens)
@@ -1038,6 +2371,13 @@ def load_codex_source():
             "Detailed response.completed usage logs were not present in this local state DB, "
             "so this dashboard uses thread-level token totals."
         )
+    if app_source.get("status") == "configured":
+        notes.append(app_source.get("notes", ""))
+        if app_source.get("included_session_count"):
+            notes.append(
+                f"Codex App counters added {app_source['total']} tokens from "
+                f"{app_source['included_session_count']} unindexed or delta-adjusted sessions."
+            )
 
     pricing = load_codex_pricing()
     busiest_day = max(daily_30, key=lambda row: row["value"], default=None)
@@ -1073,6 +2413,10 @@ def load_codex_source():
         highlights.append(
             f"Busiest day in the last 30 days was {busiest_day['day']} with {busiest_day['value']} tokens across {busiest_day['thread_count']} threads."
         )
+    if app_source.get("included_session_count"):
+        highlights.append(
+            f"Codex App counters added {app_source['total']} local tokens not yet fully indexed by SQLite."
+        )
     if effort_breakdown:
         top_effort = effort_breakdown[0]
         highlights.append(
@@ -1091,6 +2435,7 @@ def load_codex_source():
         "last_30_days": totals["tokens_30d"],
         "last_7_days": totals["tokens_7d"],
         "thread_count": totals["thread_count"],
+        "token_usage": token_usage,
         "db_path": str(db_path),
         "first_seen_local": format_local_timestamp(totals["first_seen"]),
         "last_seen_local": format_local_timestamp(totals["last_seen"]),
@@ -1099,6 +2444,7 @@ def load_codex_source():
         "daily": daily,
         "daily_30": daily_30,
         "model_breakdown": model_breakdown,
+        "model_months": model_months,
         "effort_breakdown": effort_breakdown,
         "cwd_breakdown": cwd_breakdown,
         "source_breakdown": source_breakdown,
@@ -1106,15 +2452,29 @@ def load_codex_source():
         "sandbox_breakdown": sandbox_breakdown,
         "top_threads": top_threads,
         "recent_threads": recent_threads,
+        "codex_app": app_source,
         "data_quality": {
             "log_rows": log_coverage["log_rows"],
             "first_log_local": format_local_timestamp(log_coverage["first_log"]),
             "last_log_local": format_local_timestamp(log_coverage["last_log"]),
             "response_events": response_events,
             "detailed_usage_available": response_events > 0,
+            "codex_app_sessions_seen": app_source.get("all_session_count", 0),
+            "codex_app_sessions_included": app_source.get("included_session_count", 0),
+            "codex_app_sessions_already_indexed": app_source.get("indexed_session_count", 0),
+            "codex_app_snapshot_path": app_source.get("snapshot_path"),
+            "typed_thread_count": token_usage.get("typed_thread_count", 0),
+            "token_type_coverage_pct": token_usage.get("detail_coverage_pct", 0),
         },
         "pricing": pricing,
-        "cost": build_cost_summary(total_tokens, monthly, pricing),
+        "cost": build_cost_summary(
+            total_tokens,
+            monthly,
+            pricing,
+            token_usage=token_usage,
+            models=model_breakdown,
+            model_months=model_months,
+        ),
         "highlights": highlights,
         "notes": " ".join(notes),
         "updated_at": utc_now(),
@@ -1134,13 +2494,27 @@ def build_dashboard():
     combined_7d = codex.get("last_7_days", 0) + sum(source.get("tokens_7d", 0) or 0 for source in active_remote_sources)
     combined_monthly = aggregate_monthly_series([codex.get("monthly", [])] + [source.get("monthly", []) for source in active_remote_sources])
     combined_daily = aggregate_daily_series([codex.get("daily", [])] + [source.get("daily", []) for source in active_remote_sources])
+    combined_token_usage = combine_token_usage_summaries(
+        [
+            token_usage_or_unclassified(
+                codex.get("token_usage"), codex.get("total", 0), codex.get("thread_count", 0)
+            )
+        ]
+        + [
+            token_usage_or_unclassified(
+                source.get("token_usage"),
+                source.get("total_tokens", 0),
+                source.get("thread_count", 0),
+            )
+            for source in active_remote_sources
+        ]
+    )
     aggregate_models = aggregate_named_rows(
         list(codex.get("model_breakdown", []))
         + [
             {
+                **row,
                 "label": row.get("model"),
-                "thread_count": row.get("thread_count", 0),
-                "total_tokens": row.get("total_tokens", 0),
             }
             for source in active_remote_sources
             for row in source.get("models", [])
@@ -1149,6 +2523,11 @@ def build_dashboard():
     )
     for row in aggregate_models:
         row["share_pct"] = share_pct(row["total_tokens"], combined_total_tokens)
+    combined_model_months = list(codex.get("model_months", [])) + [
+        row
+        for source in active_remote_sources
+        for row in source.get("model_months", [])
+    ]
     aggregate_workspaces = [
         {
             "label": f"Local: {row.get('label') or abbreviate_path(row.get('cwd'))}",
@@ -1180,6 +2559,9 @@ def build_dashboard():
             "total_tokens": codex.get("total", 0),
             "tokens_30d": codex.get("last_30_days", 0),
             "tokens_7d": codex.get("last_7_days", 0),
+            "token_usage": token_usage_or_unclassified(
+                codex.get("token_usage"), codex.get("total", 0), codex.get("thread_count", 0)
+            ),
             "monthly": codex.get("monthly", []),
             "daily": codex.get("daily", []),
         }
@@ -1189,9 +2571,16 @@ def build_dashboard():
             "host": source.get("host"),
             "status": source.get("status"),
             "thread_count": source.get("thread_count"),
+            "raw_thread_count": source.get("raw_thread_count"),
+            "deduplicated_subagent_count": source.get("deduplicated_subagent_count", 0),
             "total_tokens": source.get("total_tokens"),
             "tokens_30d": source.get("tokens_30d"),
             "tokens_7d": source.get("tokens_7d"),
+            "token_usage": token_usage_or_unclassified(
+                source.get("token_usage"),
+                source.get("total_tokens", 0),
+                source.get("thread_count", 0),
+            ),
             "monthly": source.get("monthly", []),
             "daily": source.get("daily", []),
             "cache_notice": source.get("cache_notice"),
@@ -1207,10 +2596,20 @@ def build_dashboard():
         "combined_thread_count": combined_thread_count,
         "combined_30d_tokens": combined_30d,
         "combined_7d_tokens": combined_7d,
+        "combined_token_usage": combined_token_usage,
         "combined_monthly": combined_monthly,
         "combined_daily": combined_daily,
-        "cost": build_cost_summary(combined_total_tokens, combined_monthly, pricing),
+        "pricing": pricing,
+        "cost": build_cost_summary(
+            combined_total_tokens,
+            combined_monthly,
+            pricing,
+            token_usage=combined_token_usage,
+            models=aggregate_models,
+            model_months=combined_model_months,
+        ),
         "models": aggregate_models,
+        "model_months": combined_model_months,
         "workspaces": aggregate_workspaces,
         "machines": machine_breakdown,
     }
