@@ -7,11 +7,19 @@ import re
 import shlex
 import sqlite3
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+
+from usage_accounting import (
+    aggregate_events as aggregate_logical_events,
+    discover_rollouts,
+    group_events as group_logical_events,
+    scan_rollouts,
+)
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -270,7 +278,7 @@ def run_remote_codex_snapshot(host_config):
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=35,
+                timeout=90,
             )
             payload = json.loads(completed.stdout.strip() or "{}")
             queried_host = candidate
@@ -291,6 +299,10 @@ def run_remote_codex_snapshot(host_config):
             "thread_count": totals.get("thread_count", 0),
             "raw_thread_count": totals.get("raw_thread_count", totals.get("thread_count", 0)),
             "deduplicated_subagent_count": totals.get("deduplicated_subagent_count", 0),
+            "raw_usage_event_count": totals.get("raw_usage_event_count", 0),
+            "unique_usage_event_count": totals.get("unique_usage_event_count", 0),
+            "replayed_usage_event_count": totals.get("replayed_usage_event_count", 0),
+            "missing_last_usage_count": totals.get("missing_last_usage_count", 0),
             "total_tokens": totals.get("total_tokens", 0),
             "tokens_30d": totals.get("tokens_30d", 0),
             "tokens_7d": totals.get("tokens_7d", 0),
@@ -338,6 +350,7 @@ def run_remote_codex_snapshot(host_config):
 def remote_query_script() -> str:
     return r'''
 import json, os, re, sqlite3, time
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -524,15 +537,25 @@ def rollout_daily(path, target, stamp):
 
 def aggregate(records):
     totals = {key: 0 for key in FIELDS}
-    typed_threads = 0
+    session_ids = set()
+    typed_session_ids = set()
     for record in records:
         usage = record["usage"]
         for key in FIELDS:
             totals[key] += integer(usage.get(key))
-        typed_threads += int(bool(usage.get("has_token_types")))
-    totals["thread_count"] = len(records)
-    totals["typed_thread_count"] = typed_threads
-    totals["detail_coverage_pct"] = 100.0 * typed_threads / len(records) if records else 0.0
+        session_id = record.get("session_id")
+        if session_id:
+            session_ids.add(session_id)
+            if usage.get("has_token_types"):
+                typed_session_ids.add(session_id)
+    totals["thread_count"] = len(session_ids) if session_ids else len(records)
+    totals["typed_thread_count"] = len(typed_session_ids) if session_ids else sum(
+        int(bool(record["usage"].get("has_token_types"))) for record in records
+    )
+    totals["detail_coverage_pct"] = (
+        100.0 * totals["typed_thread_count"] / totals["thread_count"]
+        if totals["thread_count"] else 0.0
+    )
     return totals
 
 def grouped(records, key):
@@ -622,6 +645,140 @@ def monthly_records(records):
         })
     return result
 
+def rollout_paths(rows):
+    paths = set()
+    for directory in (Path.home() / ".codex" / "sessions", Path.home() / ".codex" / "archived_sessions"):
+        if directory.exists():
+            paths.update(directory.glob("**/rollout-*.jsonl"))
+    paths.update(Path(row["rollout_path"]) for row in rows if row.get("rollout_path"))
+    return sorted(paths)
+
+def event_epoch(value):
+    if not value:
+        return None
+    text = str(value).replace("+00:00", "Z")
+    for pattern in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.strptime(text, pattern).replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+    return None
+
+def fingerprint(raw):
+    return tuple(integer((raw or {}).get(key)) for key in (
+      "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+      "output_tokens", "reasoning_output_tokens", "total_tokens",
+    ))
+
+TOKEN_USAGE_PATTERN = re.compile(
+  r'"total_token_usage"\s*:\s*(\{[^{}]*\}).*?'
+  r'"last_token_usage"\s*:\s*(\{[^{}]*\})'
+)
+TIMESTAMP_PATTERN = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
+
+def scan_logical_events_chunk(paths, metadata):
+    unique = {}
+    sessions = set()
+    raw_count = 0
+    missing_last = 0
+    local_timezone = datetime.now().astimezone().tzinfo
+    for path in paths:
+        meta = {}
+        context = {}
+        try:
+            handle = open(path, "r", encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                if not any(marker in line for marker in ('"session_meta"', '"turn_context"', '"token_count"')):
+                    continue
+                if '"token_count"' in line:
+                    usage_match = TOKEN_USAGE_PATTERN.search(line)
+                    timestamp_match = TIMESTAMP_PATTERN.search(line)
+                    if not usage_match or not timestamp_match:
+                        continue
+                    try:
+                        cumulative = json.loads(usage_match.group(1))
+                        increment = json.loads(usage_match.group(2))
+                    except Exception:
+                        continue
+                    if integer(cumulative.get("total_tokens")) <= 0:
+                        continue
+                    raw_count += 1
+                    if integer(increment.get("total_tokens")) <= 0:
+                        missing_last += 1
+                        continue
+                    session_id = str(meta.get("id") or Path(path).stem)
+                    key = (session_id, fingerprint(cumulative))
+                    previous = unique.get(key)
+                    timestamp_text = timestamp_match.group(1)
+                    if previous is not None and timestamp_text >= previous["timestamp_text"]:
+                        continue
+                    stamp = event_epoch(timestamp_text)
+                    if stamp is None:
+                        continue
+                    sqlite_meta = metadata.get(session_id) or {}
+                    local = datetime.fromtimestamp(stamp, local_timezone)
+                    unique[key] = {
+                      "event_key": key,
+                      "session_id": session_id,
+                      "day": local.strftime("%Y-%m-%d"),
+                      "month": local.strftime("%Y-%m"),
+                      "timestamp": stamp,
+                      "timestamp_text": timestamp_text,
+                      "model": context.get("model") or sqlite_meta.get("model") or "(unknown)",
+                      "cwd": context.get("cwd") or meta.get("cwd") or sqlite_meta.get("cwd") or "(unknown)",
+                      "usage": normalize(increment),
+                    }
+                    sessions.add(session_id)
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                payload = event.get("payload") or {}
+                if event.get("type") == "session_meta":
+                    meta.update(payload)
+                    continue
+                if event.get("type") == "turn_context":
+                    for field in ("model", "cwd", "effort"):
+                        if payload.get(field) is not None:
+                            context[field] = payload.get(field)
+                    continue
+    events = sorted(unique.values(), key=lambda row: row["timestamp"])
+    return events, sessions, raw_count, missing_last
+
+def scan_logical_events(paths, metadata):
+    worker_count = min(4, len(paths))
+    if worker_count < 2:
+        results = [scan_logical_events_chunk(paths, metadata)]
+    else:
+        chunks = [paths[index::worker_count] for index in range(worker_count)]
+        try:
+            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                results = list(executor.map(scan_logical_events_chunk, chunks, [metadata] * worker_count))
+        except Exception:
+            results = [scan_logical_events_chunk(paths, metadata)]
+    unique = {}
+    sessions = set()
+    raw_count = 0
+    missing_last = 0
+    for events, chunk_sessions, chunk_raw, chunk_missing in results:
+        raw_count += chunk_raw
+        missing_last += chunk_missing
+        sessions.update(chunk_sessions)
+        for event in events:
+            key = tuple(event["event_key"])
+            previous = unique.get(key)
+            if previous is None or event["timestamp_text"] < previous["timestamp_text"]:
+                unique[key] = event
+    events = sorted(unique.values(), key=lambda row: row["timestamp"])
+    for event in events:
+        event.pop("event_key", None)
+        event.pop("timestamp_text", None)
+    return events, sessions, raw_count, missing_last
+
 dbs = sorted(Path.home().glob('.codex/state_*.sqlite'))
 if not dbs:
     print(json.dumps({"status": "missing", "error": "No ~/.codex/state_*.sqlite found"}))
@@ -637,39 +794,33 @@ SELECT id, source, COALESCE(model, '(unknown)') AS model, cwd,
        tokens_used, rollout_path, updated_at
 FROM threads
 """).fetchall()]
-detail_rows = accounting_rows(raw_rows)
+metadata = {
+  str(row["id"]): {
+    "model": row.get("model") or "(unknown)",
+    "cwd": row.get("cwd") or "(unknown)",
+  }
+  for row in raw_rows
+}
+paths = rollout_paths(raw_rows)
+events, session_ids, raw_event_count, missing_last_count = scan_logical_events(paths, metadata)
 now = time.time()
 totals = {
-  "thread_count": len(detail_rows),
+  "thread_count": len(session_ids),
   "raw_thread_count": len(raw_rows),
-  "deduplicated_subagent_count": len(raw_rows) - len(detail_rows),
-  "total_tokens": sum(integer(row.get("tokens_used")) for row in detail_rows),
+  "deduplicated_subagent_count": max(len(raw_rows) - len(session_ids), 0),
+  "raw_usage_event_count": raw_event_count,
+  "unique_usage_event_count": len(events),
+  "replayed_usage_event_count": raw_event_count - missing_last_count - len(events),
+  "missing_last_usage_count": missing_last_count,
+  "total_tokens": sum(record["usage"]["total_tokens"] for record in events),
   "tokens_30d": 0,
   "tokens_7d": 0,
-  "first_seen": min((integer(row.get("updated_at")) for row in detail_rows), default=None),
-  "last_seen": max((integer(row.get("updated_at")) for row in detail_rows), default=None),
+  "first_seen": min((record["timestamp"] for record in events), default=None),
+  "last_seen": max((record["timestamp"] for record in events), default=None),
 }
-records = []
-daily_records = []
-for row in detail_rows:
-    stamp = integer(row.get("updated_at"))
-    records.append({
-      "month": time.strftime("%Y-%m", time.localtime(stamp)),
-      "day": time.strftime("%Y-%m-%d", time.localtime(stamp)),
-      "model": row.get("model") or "(unknown)",
-      "cwd": row.get("cwd") or "(unknown)",
-      "usage": scale(latest(row.get("rollout_path")), row.get("tokens_used")),
-    })
-    for item in rollout_daily(row.get("rollout_path"), row.get("tokens_used"), stamp):
-        daily_records.append({
-          "session_id": row.get("id"),
-          "month": item["day"][:7],
-          "day": item["day"],
-          "model": row.get("model") or "(unknown)",
-          "cwd": row.get("cwd") or "(unknown)",
-          "usage": item["usage"],
-        })
-month_records = monthly_records(daily_records)
+records = events
+daily_records = events
+month_records = events
 cutoff_30 = time.strftime("%Y-%m-%d", time.localtime(now - 30 * 86400))
 cutoff_7 = time.strftime("%Y-%m-%d", time.localtime(now - 7 * 86400))
 totals["tokens_30d"] = sum(record["usage"]["total_tokens"] for record in daily_records if record["day"] >= cutoff_30)
@@ -2481,9 +2632,246 @@ def load_codex_source():
     }
 
 
+def load_codex_source_event_based():
+    db_paths = sorted(glob.glob(str(HOME / ".codex" / "state_*.sqlite")))
+    if not db_paths:
+        return {
+            "provider": "codex",
+            "display_name": "Codex",
+            "status": "missing",
+            "notes": "No ~/.codex/state_*.sqlite database was found.",
+            "monthly": [],
+            "daily": [],
+            "model_breakdown": [],
+            "cwd_breakdown": [],
+        }
+
+    db_path = Path(db_paths[-1])
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    cursor = connection.cursor()
+    raw_rows = fetch_all_dicts(
+        cursor,
+        """
+        SELECT id, title, cwd, source, thread_source, model, reasoning_effort,
+               approval_mode, sandbox_policy, tokens_used, rollout_path, updated_at
+        FROM threads
+        """,
+    )
+    log_coverage = {"log_rows": 0, "first_log": None, "last_log": None}
+    response_events = 0
+    if table_exists(cursor, "logs"):
+        response_events = cursor.execute(
+            "SELECT COUNT(*) FROM logs WHERE message LIKE '%response.completed%'"
+        ).fetchone()[0]
+        log_coverage = dict(cursor.execute(
+            "SELECT COUNT(*) AS log_rows, MIN(ts) AS first_log, MAX(ts) AS last_log FROM logs"
+        ).fetchone())
+    connection.close()
+
+    metadata = {}
+    titles = {}
+    rollout_paths = set(discover_rollouts(HOME / ".codex"))
+    for row in raw_rows:
+        session_id = str(row.get("id") or "")
+        if session_id:
+            metadata[session_id] = {
+                "model": row.get("model") or "(unknown)",
+                "cwd": row.get("cwd") or "(unknown)",
+                "reasoning": row.get("reasoning_effort") or "(unknown)",
+                "approval": row.get("approval_mode") or "(unknown)",
+                "entry_point": normalize_thread_source(row),
+            }
+            titles[session_id] = row
+        if row.get("rollout_path"):
+            rollout_paths.add(Path(row["rollout_path"]))
+
+    scan = scan_rollouts(sorted(rollout_paths), metadata)
+    events = scan["events"]
+    sessions = scan["sessions"]
+    token_usage = aggregate_logical_events(events)
+    total_tokens = token_usage["total_tokens"]
+
+    daily = sorted(group_logical_events(events, "day"), key=lambda row: row["day"])
+    monthly = sorted(group_logical_events(events, "month"), key=lambda row: row["month"], reverse=True)
+    model_breakdown = sorted(
+        group_logical_events(events, "model"), key=lambda row: row["total_tokens"], reverse=True
+    )
+    model_months = group_logical_events(events, ("month", "model"))
+    cwd_breakdown = sorted(
+        group_logical_events(events, "cwd"), key=lambda row: row["total_tokens"], reverse=True
+    )[:8]
+    effort_breakdown = sorted(
+        group_logical_events(events, "reasoning"), key=lambda row: row["total_tokens"], reverse=True
+    )
+    source_breakdown = sorted(
+        group_logical_events(events, "entry_point"), key=lambda row: row["total_tokens"], reverse=True
+    )
+    approval_breakdown = sorted(
+        group_logical_events(events, "approval"), key=lambda row: row["total_tokens"], reverse=True
+    )
+
+    for row in monthly:
+        row["avg_tokens"] = round(row["value"] / row["thread_count"], 0) if row["thread_count"] else 0
+        row["share_pct"] = share_pct(row["value"], total_tokens)
+    for row in model_breakdown:
+        row["label"] = row["model"]
+        row["avg_tokens"] = round(row["value"] / row["thread_count"], 0) if row["thread_count"] else 0
+        row["share_pct"] = share_pct(row["value"], total_tokens)
+    for row in cwd_breakdown:
+        row["label"] = abbreviate_path(row["cwd"])
+        row["avg_tokens"] = round(row["value"] / row["thread_count"], 0) if row["thread_count"] else 0
+        row["share_pct"] = share_pct(row["value"], total_tokens)
+    for row in effort_breakdown:
+        row["reasoning_effort"] = row.pop("reasoning")
+        row["share_pct"] = share_pct(row["value"], total_tokens)
+    for row in source_breakdown:
+        row["label"] = row.pop("entry_point")
+        row["share_pct"] = share_pct(row["value"], total_tokens)
+    for row in approval_breakdown:
+        row["approval_mode"] = row.pop("approval")
+        row["share_pct"] = share_pct(row["value"], total_tokens)
+
+    now = datetime.now().astimezone()
+    cutoff_30_day = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+    cutoff_7_day = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+    daily_30 = [row for row in daily if row["day"] >= cutoff_30_day]
+    tokens_30d = sum(row["value"] for row in daily_30)
+    tokens_7d = sum(row["value"] for row in daily if row["day"] >= cutoff_7_day)
+    for row in daily_30:
+        row["share_pct_30d"] = share_pct(row["value"], tokens_30d)
+
+    session_rows = []
+    for session in sessions:
+        usage = session.get("usage") or {}
+        sqlite_row = titles.get(session["session_id"], {})
+        session_rows.append(
+            {
+                "title": sqlite_row.get("title") or session["session_id"],
+                "cwd": session.get("cwd") or sqlite_row.get("cwd") or "(unknown)",
+                "model_provider": "openai",
+                "model": session.get("model") or sqlite_row.get("model") or "(unknown)",
+                "reasoning_effort": session.get("reasoning") or "(unknown)",
+                "approval_mode": session.get("approval") or "(unknown)",
+                "tokens_used": usage.get("total_tokens", 0),
+                "updated_at": session.get("last_seen", 0),
+            }
+        )
+    top_threads = sorted(session_rows, key=lambda row: row["tokens_used"], reverse=True)[:8]
+    recent_threads = sorted(session_rows, key=lambda row: row["updated_at"], reverse=True)[:8]
+    for row in top_threads + recent_threads:
+        row["title_short"] = tidy_title(row["title"])
+        row["cwd_short"] = abbreviate_path(row["cwd"])
+        row["updated_local"] = format_local_timestamp(row["updated_at"])
+        row["share_pct"] = share_pct(row["tokens_used"], total_tokens)
+
+    thread_tokens = [row["tokens_used"] for row in session_rows]
+    top_workspace = cwd_breakdown[0] if cwd_breakdown else None
+    busiest_day = max(daily_30, key=lambda row: row["value"], default=None)
+    stats = {
+        "avg_tokens_per_thread": round(total_tokens / len(sessions), 0) if sessions else 0,
+        "median_tokens_per_thread": median(thread_tokens),
+        "p90_tokens_per_thread": percentile(thread_tokens, 0.9),
+        "largest_thread_tokens": max(thread_tokens) if thread_tokens else 0,
+        "zero_token_threads": sum(1 for value in thread_tokens if value == 0),
+        "active_days_total": len(daily),
+        "active_days_30d": len(daily_30),
+        "top_three_threads_share_pct": share_pct(sum(sorted(thread_tokens, reverse=True)[:3]), total_tokens),
+        "top_workspace_share_pct": share_pct(top_workspace["total_tokens"], total_tokens) if top_workspace else None,
+    }
+    highlights = []
+    if top_workspace:
+        highlights.append(
+            f"Top workspace {top_workspace['label']} accounts for {stats['top_workspace_share_pct']}% of all tokens."
+        )
+    if busiest_day:
+        highlights.append(
+            f"Busiest day in the last 30 days was {busiest_day['day']} with {busiest_day['value']} tokens."
+        )
+
+    pricing = load_codex_pricing()
+    notes = (
+        f"Reading {scan['file_count']} rollout files referenced by {db_path.name}. "
+        f"Counted {scan['unique_event_count']} unique API usage increments across "
+        f"{scan['logical_session_count']} logical sessions; removed "
+        f"{scan['duplicate_event_count']} replayed increments. Periods use each increment's event time."
+    )
+    first_seen = min((event["timestamp"] for event in events), default=None)
+    last_seen = max((event["timestamp"] for event in events), default=None)
+    return {
+        "provider": "codex",
+        "display_name": "Codex",
+        "status": "configured",
+        "ingestion": "automatic-logical-rollout-events",
+        "label": "Local Codex logical sessions",
+        "metric": "tokens",
+        "unit": "tokens",
+        "total": total_tokens,
+        "last_30_days": tokens_30d,
+        "last_7_days": tokens_7d,
+        "thread_count": len(sessions),
+        "raw_thread_count": len(raw_rows),
+        "deduplicated_event_count": scan["duplicate_event_count"],
+        "token_usage": token_usage,
+        "db_path": str(db_path),
+        "first_seen_local": format_local_timestamp(first_seen),
+        "last_seen_local": format_local_timestamp(last_seen),
+        "stats": stats,
+        "monthly": monthly,
+        "daily": daily,
+        "daily_30": daily_30,
+        "model_breakdown": model_breakdown,
+        "model_months": model_months,
+        "effort_breakdown": effort_breakdown,
+        "cwd_breakdown": cwd_breakdown,
+        "source_breakdown": source_breakdown,
+        "approval_breakdown": approval_breakdown,
+        "sandbox_breakdown": [],
+        "top_threads": top_threads,
+        "recent_threads": recent_threads,
+        "codex_app": {"status": "absorbed", "notes": "Codex App rollout events are included by logical session."},
+        "data_quality": {
+            "log_rows": log_coverage["log_rows"],
+            "first_log_local": format_local_timestamp(log_coverage["first_log"]),
+            "last_log_local": format_local_timestamp(log_coverage["last_log"]),
+            "response_events": response_events,
+            "detailed_usage_available": bool(events),
+            "rollout_file_count": scan["file_count"],
+            "logical_session_count": scan["logical_session_count"],
+            "raw_usage_event_count": scan["raw_event_count"],
+            "unique_usage_event_count": scan["unique_event_count"],
+            "replayed_usage_event_count": scan["duplicate_event_count"],
+            "missing_last_usage_count": scan["missing_last_usage_count"],
+            "typed_thread_count": token_usage["typed_thread_count"],
+            "token_type_coverage_pct": token_usage["detail_coverage_pct"],
+        },
+        "pricing": pricing,
+        "cost": build_cost_summary(
+            total_tokens,
+            monthly,
+            pricing,
+            token_usage=token_usage,
+            models=model_breakdown,
+            model_months=model_months,
+        ),
+        "highlights": highlights,
+        "notes": notes,
+        "updated_at": utc_now(),
+    }
+
+
+load_codex_source_legacy = load_codex_source
+load_codex_source = load_codex_source_event_based
+
+
 def build_dashboard():
-    codex = load_codex_source()
-    remote_sources = [run_remote_codex_snapshot(config) for config in REMOTE_CODEX_HOSTS]
+    with ThreadPoolExecutor(max_workers=1 + len(REMOTE_CODEX_HOSTS)) as executor:
+        local_future = executor.submit(load_codex_source)
+        remote_futures = [
+            executor.submit(run_remote_codex_snapshot, config) for config in REMOTE_CODEX_HOSTS
+        ]
+        codex = local_future.result()
+        remote_sources = [future.result() for future in remote_futures]
     pricing = codex.get("pricing") or load_codex_pricing()
     active_remote_sources = [
         source for source in remote_sources if source.get("status") in {"configured", "cached"}

@@ -14,10 +14,7 @@ const activityScopeSelect = document.getElementById("activity-scope");
 const activityModeButtons = Array.from(document.querySelectorAll("[data-activity-mode]"));
 const refreshButtonDefaultLabel = refreshButton ? refreshButton.textContent : "Refresh";
 let dashboardPayload = null;
-let activeDrawerMonth = null;
-let activeDrawerDay = null;
-let activeDrawerMachineHost = null;
-let activeDrawerTypeScope = "month";
+let activeDrawerScope = null;
 let activeActivityMode = "daily";
 let activeActivityScope = "fleet";
 let scrollTopUpdatePending = false;
@@ -506,12 +503,13 @@ function normaliseActivityRows(rows) {
       continue;
     }
     const day = dateKey(parsed);
-    const bucket = byDay.get(day) || { day, value: 0, thread_count: 0 };
-    bucket.value += Number(row.value || 0);
-    bucket.thread_count += Number(row.thread_count || 0);
+    const bucket = byDay.get(day) || [];
+    bucket.push(row);
     byDay.set(day, bucket);
   }
-  return [...byDay.values()].sort((left, right) => left.day.localeCompare(right.day));
+  return [...byDay.entries()]
+    .map(([day, dayRows]) => aggregateTokenRows(dayRows, { day }))
+    .sort((left, right) => left.day.localeCompare(right.day));
 }
 
 function activityRowsForScope(payload) {
@@ -581,45 +579,49 @@ function buildActivityTimeline(rows, mode) {
   const gridEnd = endOfWeek(endDate);
   const rawByDay = new Map(normalizedRows.map((row) => [row.day, row]));
   const valuesByDay = new Map();
-  const rollingValues = [];
-  let rollingTotal = 0;
-  let cumulativeTotal = 0;
+  const cumulativeStartKey = normalizedRows.length ? normalizedRows[0].day : startKey;
+  let cumulativeRow = aggregateTokenRows(
+    normalizedRows.filter((row) => row.day < startKey),
+    { start_day: cumulativeStartKey, end_day: dateKey(addDays(startDate, -1)) }
+  );
 
   for (let date = startDate; date <= endDate; date = addDays(date, 1)) {
     const day = dateKey(date);
-    const raw = rawByDay.get(day) || { day, value: 0, thread_count: 0 };
+    const raw = rawByDay.get(day) || aggregateTokenRows([], { day });
     const rawValue = Number(raw.value || 0);
-    rollingValues.push(rawValue);
-    rollingTotal += rawValue;
-    if (rollingValues.length > 7) {
-      rollingTotal -= rollingValues.shift();
-    }
-    cumulativeTotal += rawValue;
-    const weeklyValue = rollingTotal;
-    const cumulativeValue = cumulativeTotal;
-    let value = rawValue;
-    if (mode === "weekly") {
-      value = weeklyValue;
-    } else if (mode === "cumulative") {
-      value = cumulativeValue;
-    }
+    cumulativeRow = aggregateTokenRows([cumulativeRow, raw], {
+      start_day: cumulativeStartKey,
+      end_day: day,
+    });
+    const cumulativeValue = Number(cumulativeRow.value || 0);
+    const scopedRow = mode === "cumulative" ? cumulativeRow : raw;
     valuesByDay.set(day, {
+      ...scopedRow,
       day,
-      value,
+      value: Number(scopedRow.value || 0),
       rawValue,
-      weeklyValue,
       cumulativeValue,
-      thread_count: Number(raw.thread_count || 0),
+      dailyThreadCount: Number(raw.thread_count || 0),
       inRange: true,
     });
   }
 
   const weeks = [];
+  const weeklyValues = [];
   const cells = [];
   let weekIndex = 0;
   for (let weekStart = gridStart; weekStart <= gridEnd; weekStart = addDays(weekStart, 7)) {
     weekIndex += 1;
-    weeks.push({ index: weekIndex, start: dateKey(weekStart) });
+    const weekEnd = addDays(weekStart, 6);
+    const weekStartKey = dateKey(weekStart);
+    const weekEndKey = dateKey(weekEnd);
+    const weekRow = aggregateTokenRows(
+      normalizedRows.filter((row) => row.day >= weekStartKey && row.day <= weekEndKey),
+      { start_day: weekStartKey, end_day: weekEndKey }
+    );
+    const week = { index: weekIndex, start: weekStartKey, end: weekEndKey, row: weekRow };
+    weeks.push(week);
+    weeklyValues.push(weekRow);
     for (let offset = 0; offset < 7; offset += 1) {
       const date = addDays(weekStart, offset);
       const day = dateKey(date);
@@ -628,7 +630,6 @@ function buildActivityTimeline(rows, mode) {
         day,
         value: 0,
         rawValue: 0,
-        weeklyValue: 0,
         cumulativeValue: 0,
         thread_count: 0,
       };
@@ -648,11 +649,13 @@ function buildActivityTimeline(rows, mode) {
     normalizedRows,
     cells,
     values: [...valuesByDay.values()],
+    weeklyValues,
     weeks,
     startDate,
     endDate,
     startKey,
     endKey,
+    cumulativeStartKey,
   };
 }
 
@@ -689,14 +692,14 @@ function activityLevel(value, maxValue) {
 
 function activityCellTitle(cell, mode) {
   const dayTokens = `${formatTokens(cell.rawValue)} tokens`;
-  const threads = `${formatTokens(cell.thread_count)} threads`;
-  if (mode === "weekly") {
-    return `${formatDayName(cell.day)} · ${formatTokens(cell.weeklyValue)} tokens over 7 days · ${dayTokens} on day`;
-  }
   if (mode === "cumulative") {
     return `${formatDayName(cell.day)} · ${formatTokens(cell.cumulativeValue)} cumulative tokens · ${dayTokens} on day`;
   }
-  return `${formatDayName(cell.day)} · ${dayTokens} · ${threads}`;
+  return `${formatDayName(cell.day)} · ${dayTokens} · ${formatTokens(cell.dailyThreadCount)} threads`;
+}
+
+function activityWeekTitle(week) {
+  return `${formatDayName(week.start)} - ${formatDayName(week.end)} · ${formatTokens(week.row.value)} tokens · ${formatTokens(week.row.thread_count)} thread records`;
 }
 
 function renderActivitySummary(payload, timeline, scopeLabel) {
@@ -704,12 +707,18 @@ function renderActivitySummary(payload, timeline, scopeLabel) {
     return;
   }
   const activeDays = timeline.values.filter(
-    (row) => Number(row.rawValue || 0) > 0 || Number(row.thread_count || 0) > 0
+    (row) => Number(row.rawValue || 0) > 0 || Number(row.dailyThreadCount || 0) > 0
   );
   const rawTotal = sumRows(timeline.values, "rawValue");
-  const peak = [...timeline.values].sort((left, right) => Number(right.value || 0) - Number(left.value || 0))[0];
-  const peakLabel = activeActivityMode === "weekly" ? "Peak Week" : activeActivityMode === "cumulative" ? "Range Total" : "Peak Day";
-  const peakValue = peak ? `${formatCompactNumber(peak.value)} · ${peak.day.slice(5)}` : "n/a";
+  const scopeValues = activeActivityMode === "weekly" ? timeline.weeklyValues : timeline.values;
+  const peak = [...scopeValues].sort((left, right) => Number(right.value || 0) - Number(left.value || 0))[0];
+  const peakLabel = activeActivityMode === "weekly" ? "Peak Week" : activeActivityMode === "cumulative" ? "Latest Total" : "Peak Day";
+  const peakPeriod = peak
+    ? activeActivityMode === "weekly"
+      ? peak.start_day.slice(5)
+      : peak.day.slice(5)
+    : "";
+  const peakValue = peak ? `${formatCompactNumber(peak.value)} · ${peakPeriod}` : "n/a";
   const items = [
     ["Scope", scopeLabel],
     ["Mode", activityModeLabel()],
@@ -796,6 +805,7 @@ function renderMonthlyTokenActivity(payload, scopeLabel) {
               class="monthly-activity-cell activity-level-${activityLevel(row.value, maxValue)}"
               type="button"
               ${renderDataAttributes({
+                "activity-kind": "month",
                 "activity-month": row.month,
                 "activity-machine": activeActivityScope === "fleet" ? "" : activeActivityScope,
               })}
@@ -825,9 +835,62 @@ function renderTokenActivity(payload) {
     return;
   }
   const timeline = buildActivityTimeline(activityRowsForScope(payload), activeActivityMode);
-  const maxValue = Math.max(...timeline.values.map((row) => Number(row.value || 0)), 0);
+  const activityValues = activeActivityMode === "weekly" ? timeline.weeklyValues : timeline.values;
+  const maxValue = Math.max(...activityValues.map((row) => Number(row.value || 0)), 0);
   const monthLabels = buildActivityMonthLabels(timeline);
   renderActivitySummary(payload, timeline, scopeLabel);
+  const activityCells =
+    activeActivityMode === "weekly"
+      ? timeline.weeks
+          .map((week) => {
+            const title = activityWeekTitle(week);
+            return `
+              <button
+                class="activity-cell activity-level-${activityLevel(week.row.value, maxValue)}"
+                type="button"
+                style="grid-column: ${week.index}; grid-row: 4"
+                ${renderDataAttributes({
+                  "activity-kind": "week",
+                  "activity-start": week.start,
+                  "activity-end": week.end,
+                  "activity-machine": activeActivityScope === "fleet" ? "" : activeActivityScope,
+                })}
+                aria-label="${escapeHtml(title)}"
+                title="${escapeHtml(title)}"
+              >
+                <span class="sr-only">${escapeHtml(title)}</span>
+              </button>
+            `;
+          })
+          .join("")
+      : timeline.cells
+          .map((cell) => {
+            const level = activityLevel(cell.value, maxValue);
+            const title = cell.inRange ? activityCellTitle(cell, activeActivityMode) : "";
+            const dataAttrs = cell.inRange
+              ? renderDataAttributes({
+                  "activity-kind": activeActivityMode === "cumulative" ? "cumulative" : "day",
+                  "activity-day": cell.day,
+                  "activity-start": activeActivityMode === "cumulative" ? timeline.cumulativeStartKey : cell.day,
+                  "activity-end": cell.day,
+                  "activity-machine": activeActivityScope === "fleet" ? "" : activeActivityScope,
+                })
+              : "";
+            return `
+              <button
+                class="activity-cell activity-level-${level}${cell.inRange ? "" : " is-outside-range"}"
+                type="button"
+                style="grid-column: ${cell.weekIndex}; grid-row: ${cell.dayOfWeek + 1}"
+                ${dataAttrs}
+                ${cell.inRange ? "" : "disabled"}
+                aria-label="${escapeHtml(title || "Outside visible range")}"
+                title="${escapeHtml(title)}"
+              >
+                <span class="sr-only">${escapeHtml(title)}</span>
+              </button>
+            `;
+          })
+          .join("");
 
   tokenActivity.innerHTML = `
     <div class="activity-map-scroll">
@@ -846,31 +909,7 @@ function renderTokenActivity(payload) {
           role="grid"
           aria-label="${escapeHtml(`${scopeLabel} ${activityModeLabel().toLowerCase()} token activity from ${formatDayName(dateKey(timeline.startDate))} to ${formatDayName(dateKey(timeline.endDate))}`)}"
         >
-          ${timeline.cells
-            .map((cell) => {
-              const level = activityLevel(cell.value, maxValue);
-              const title = cell.inRange ? activityCellTitle(cell, activeActivityMode) : "";
-              const dataAttrs = cell.inRange
-                ? renderDataAttributes({
-                    "activity-day": cell.day,
-                    "activity-machine": activeActivityScope === "fleet" ? "" : activeActivityScope,
-                  })
-                : "";
-              return `
-                <button
-                  class="activity-cell activity-level-${level}${cell.inRange ? "" : " is-outside-range"}"
-                  type="button"
-                  style="grid-column: ${cell.weekIndex}; grid-row: ${cell.dayOfWeek + 1}"
-                  ${dataAttrs}
-                  ${cell.inRange ? "" : "disabled"}
-                  aria-label="${escapeHtml(title || "Outside visible range")}"
-                  title="${escapeHtml(title)}"
-                >
-                  <span class="sr-only">${escapeHtml(title)}</span>
-                </button>
-              `;
-            })
-            .join("")}
+          ${activityCells}
         </div>
         <div class="activity-months" aria-hidden="true">
           ${monthLabels
@@ -913,23 +952,6 @@ function filledDailyRowsForMonth(rows, month) {
       thread_count: existing ? Number(existing.thread_count || 0) : 0,
     };
   });
-}
-
-function defaultDayForMonth(rows) {
-  const activeRows = (rows || []).filter(
-    (row) => Number(row.value || 0) > 0 || Number(row.thread_count || 0) > 0
-  );
-  const candidates = activeRows.length ? activeRows : rows || [];
-  if (!candidates.length) {
-    return null;
-  }
-  return [...candidates].sort((left, right) => {
-    const valueDelta = Number(right.value || 0) - Number(left.value || 0);
-    if (valueDelta !== 0) {
-      return valueDelta;
-    }
-    return String(right.day).localeCompare(String(left.day));
-  })[0].day;
 }
 
 function machineStatusText(machine) {
@@ -983,6 +1005,52 @@ function tokenUsageForRow(row) {
   };
 }
 
+function aggregateTokenRows(rows, identity = {}) {
+  const totals = (rows || []).reduce(
+    (sum, row) => {
+      const usage = tokenUsageForRow(row);
+      sum.total += usage.total;
+      sum.input += usage.input;
+      sum.cached += usage.cached;
+      sum.uncached += usage.uncached;
+      sum.output += usage.output;
+      sum.reasoning += usage.reasoning;
+      sum.nonReasoning += usage.nonReasoning;
+      sum.unclassified += usage.unclassified;
+      sum.threadCount += usage.threadCount;
+      sum.typedThreadCount += usage.typedThreadCount;
+      return sum;
+    },
+    {
+      total: 0,
+      input: 0,
+      cached: 0,
+      uncached: 0,
+      output: 0,
+      reasoning: 0,
+      nonReasoning: 0,
+      unclassified: 0,
+      threadCount: 0,
+      typedThreadCount: 0,
+    }
+  );
+  return {
+    ...identity,
+    value: totals.total,
+    total_tokens: totals.total,
+    input_tokens: totals.input,
+    cached_input_tokens: totals.cached,
+    uncached_input_tokens: totals.uncached,
+    output_tokens: totals.output,
+    reasoning_output_tokens: totals.reasoning,
+    non_reasoning_output_tokens: totals.nonReasoning,
+    unclassified_tokens: totals.unclassified,
+    thread_count: totals.threadCount,
+    typed_thread_count: totals.typedThreadCount,
+    detail_coverage_pct: totals.threadCount ? (totals.typedThreadCount * 100.0) / totals.threadCount : 0,
+  };
+}
+
 function renderTokenTypeDetail(row) {
   const usage = tokenUsageForRow(row);
   const rows = [
@@ -999,9 +1067,7 @@ function renderTokenTypeDetail(row) {
       tone: "non-reasoning",
     },
   ];
-  if (usage.unclassified > 0) {
-    rows.push({ label: "Unclassified", value: usage.unclassified, tone: "unclassified" });
-  }
+  rows.push({ label: "Unclassified", value: usage.unclassified, tone: "unclassified" });
   const detailRows = rows
     .map((item) => {
       const totalShare = usage.total ? (item.value * 100) / usage.total : 0;
@@ -1029,85 +1095,142 @@ function renderTokenTypeDetail(row) {
   `;
 }
 
-function renderMonthDrawer(month) {
-  if (!dashboardPayload || !monthDrawer) {
+function filledDailyRowsForRange(rows, startDay, endDay) {
+  const start = parseDateKey(startDay);
+  const end = parseDateKey(endDay);
+  if (!start || !end || start > end) {
+    return [];
+  }
+  const byDay = new Map(normaliseActivityRows(rows).map((row) => [row.day, row]));
+  const result = [];
+  for (let date = start; date <= end; date = addDays(date, 1)) {
+    const day = dateKey(date);
+    result.push(byDay.get(day) || aggregateTokenRows([], { day }));
+  }
+  return result;
+}
+
+function activityScopeBounds(scope) {
+  if (scope.kind === "month") {
+    const [year, month] = String(scope.month || "").split("-").map(Number);
+    if (!year || !month) {
+      return { startDay: "", endDay: "" };
+    }
+    return {
+      startDay: `${scope.month}-01`,
+      endDay: dateKey(new Date(year, month, 0)),
+    };
+  }
+  const day = scope.day || scope.endDay || scope.startDay || "";
+  return {
+    startDay: scope.startDay || day,
+    endDay: scope.endDay || day,
+  };
+}
+
+function rowForActivityScope(dailyRows, monthlyRows, scope) {
+  if (scope.kind === "month") {
+    const monthlyRow = (monthlyRows || []).find((row) => row.month === scope.month);
+    if (monthlyRow) {
+      return monthlyRow;
+    }
+  }
+  const { startDay, endDay } = activityScopeBounds(scope);
+  const rows = normaliseActivityRows(dailyRows).filter(
+    (row) => row.day >= startDay && row.day <= endDay
+  );
+  return aggregateTokenRows(rows, { start_day: startDay, end_day: endDay });
+}
+
+function drawerPeriodLabel(scope) {
+  const { startDay, endDay } = activityScopeBounds(scope);
+  if (scope.kind === "month") {
+    return formatMonthName(scope.month);
+  }
+  if (scope.kind === "day") {
+    return formatDayName(startDay);
+  }
+  if (scope.kind === "week") {
+    return `${formatDayName(startDay)} - ${formatDayName(endDay)}`;
+  }
+  return `${formatDayName(startDay)} - ${formatDayName(endDay)}`;
+}
+
+function drawerTitle(scope, machine) {
+  const prefix = machine ? `${machine.label} · ` : "";
+  if (scope.kind === "month") {
+    return `${prefix}${formatMonthName(scope.month)}`;
+  }
+  if (scope.kind === "day") {
+    return `${prefix}${formatDayName(scope.day)}`;
+  }
+  if (scope.kind === "week") {
+    return `${prefix}Calendar Week`;
+  }
+  return `${prefix}Cumulative Through ${formatDayName(scope.endDay)}`;
+}
+
+function drawerChartRows(dailyRows, scope) {
+  const { startDay, endDay } = activityScopeBounds(scope);
+  if (scope.kind === "cumulative") {
+    return [];
+  }
+  if (scope.kind === "week") {
+    return filledDailyRowsForRange(dailyRows, startDay, endDay);
+  }
+  const month = scope.kind === "month" ? scope.month : String(startDay).slice(0, 7);
+  return filledDailyRowsForMonth(dailyRows, month);
+}
+
+function renderActivityDrawer(scope) {
+  if (!dashboardPayload || !monthDrawer || !scope) {
     return;
   }
 
-  const scopedMachine = findMachineByHost(activeDrawerMachineHost);
+  const scopedMachine = findMachineByHost(scope.machineHost);
   const scopeLabel = machineDisplayName(scopedMachine);
   const monthlyRows = scopedMachine ? scopedMachine.monthly || [] : dashboardPayload.fleet?.combined_monthly || [];
   const dailyRows = scopedMachine ? scopedMachine.daily || [] : dashboardPayload.fleet?.combined_daily || [];
-  const monthlyRow = monthlyRows.find((row) => row.month === month);
-  const monthDailyRows = filledDailyRowsForMonth(dailyRows, month);
-  const monthlyTotal = Number(monthlyRow?.value ?? sumRows(monthDailyRows));
-  const dailyTotal = sumRows(monthDailyRows);
-  const activeDays = monthDailyRows.filter((row) => Number(row.value || 0) > 0 || Number(row.thread_count || 0) > 0).length;
-  const dailyDetailIsComplete = monthlyTotal === dailyTotal;
-  if (!activeDrawerDay || !String(activeDrawerDay).startsWith(`${month}-`)) {
-    activeDrawerDay = defaultDayForMonth(monthDailyRows);
-  }
-  const selectedDayRow = monthDailyRows.find((row) => row.day === activeDrawerDay) || {
-    day: activeDrawerDay,
-    value: 0,
-    thread_count: 0,
-  };
-  const selectedDayTokens = Number(selectedDayRow.value || 0);
-  const selectedDayThreads = Number(selectedDayRow.thread_count || 0);
-  const selectedDayShare = monthlyTotal ? (selectedDayTokens * 100.0) / monthlyTotal : null;
+  const detailRow = rowForActivityScope(dailyRows, monthlyRows, scope);
+  const usage = tokenUsageForRow(detailRow);
+  const periodLabel = drawerPeriodLabel(scope);
   const drawerMachines = scopedMachine ? [scopedMachine] : dashboardPayload.fleet?.machines || [];
-  const selectedMachineRows = drawerMachines
+  const machineRows = drawerMachines
     .map((machine) => {
-      const machineDayRow = (machine.daily || []).find((row) => row.day === activeDrawerDay);
-      const tokens = Number(machineDayRow?.value || 0);
-      const threadCount = Number(machineDayRow?.thread_count || 0);
-      const hasDayData = scopedMachine || tokens > 0 || threadCount > 0;
+      const row = rowForActivityScope(machine.daily || [], machine.monthly || [], scope);
+      const machineUsage = tokenUsageForRow(row);
       return {
         title: machineDisplayName(machine),
-        value: formatTokens(tokens),
-        sortValue: tokens,
+        value: formatTokens(machineUsage.total),
+        sortValue: machineUsage.total,
         meta: [
-          `${formatTokens(threadCount)} threads`,
+          `${formatTokens(machineUsage.threadCount)} ${scope.kind === "month" || scope.kind === "day" ? "threads" : "thread records"}`,
           machineStatusText(machine),
-          selectedDayTokens && !scopedMachine ? `${formatPercent((tokens * 100.0) / selectedDayTokens)} of day` : "",
-          scopedMachine && selectedDayShare !== null ? `${formatPercent(selectedDayShare)} of machine month` : "",
+          usage.total && !scopedMachine ? `${formatPercent((machineUsage.total * 100.0) / usage.total)} of scope` : "",
         ]
           .filter(Boolean)
           .join(" · "),
-        hasDayData,
       };
     })
-    .filter((row) => row.hasDayData)
+    .filter((row) => scopedMachine || row.sortValue > 0)
     .sort((left, right) => right.sortValue - left.sortValue);
-  const metaParts = [
-    scopeLabel,
-    activeDrawerDay ? formatDayName(activeDrawerDay) : formatMonthName(month),
-    `${formatTokens(monthlyTotal)} tokens in ${formatMonthName(month)}`,
-    `${formatTokens(activeDays)} active days`,
-  ];
-  if (!dailyDetailIsComplete) {
-    metaParts.push(`${formatTokens(dailyTotal)} tokens have daily detail`);
-  }
+  const threadLabel = scope.kind === "month" || scope.kind === "day" ? "Threads" : "Thread Records";
 
-  document.getElementById("month-drawer-title").textContent =
-    scopedMachine ? `${scopedMachine.label} · ${formatMonthName(month)}` : formatMonthName(month);
-  document.getElementById("month-drawer-meta").textContent = metaParts.join(" · ");
+  document.getElementById("month-drawer-title").textContent = drawerTitle(scope, scopedMachine);
+  document.getElementById("month-drawer-meta").textContent = [
+    scopeLabel,
+    periodLabel,
+    `${formatTokens(usage.total)} tokens`,
+  ].join(" · ");
   document.getElementById("month-machine-list-title").textContent = scopedMachine ? "Machine" : "Machines";
   setHtml(
     "month-drawer-metrics",
-    (scopedMachine
-      ? [
-          ["Day Tokens", formatTokens(selectedDayTokens)],
-          ["Day Threads", formatTokens(selectedDayThreads)],
-          ["Share of Machine Month", formatPercent(selectedDayShare)],
-          ["Machine Month", formatTokens(monthlyTotal)],
-        ]
-      : [
-          ["Day Tokens", formatTokens(selectedDayTokens)],
-          ["Day Threads", formatTokens(selectedDayThreads)],
-          ["Share of Month", formatPercent(selectedDayShare)],
-          ["Active Machines", formatTokens(selectedMachineRows.length)],
-        ])
+    [
+      ["Scope Tokens", formatTokens(usage.total)],
+      [threadLabel, formatTokens(usage.threadCount)],
+      ["Typed Detail", formatTokens(usage.typedThreadCount)],
+      ["Coverage", formatPercent(usage.coverage)],
+    ]
       .map(
         ([label, value]) => `
           <div class="metric">
@@ -1119,45 +1242,34 @@ function renderMonthDrawer(month) {
       .join("")
   );
 
-  const typeDetailRow =
-    activeDrawerTypeScope === "day"
-      ? selectedDayRow
-      : monthlyRow || { value: monthlyTotal, thread_count: monthDailyRows.reduce((sum, row) => sum + Number(row.thread_count || 0), 0) };
-  const typeUsage = tokenUsageForRow(typeDetailRow);
-  const typePeriodLabel =
-    activeDrawerTypeScope === "day" && activeDrawerDay
-      ? formatDayName(activeDrawerDay)
-      : formatMonthName(month);
-  setHtml("month-token-types", renderTokenTypeDetail(typeDetailRow));
+  setHtml("month-token-types", renderTokenTypeDetail(detailRow));
   document.getElementById("token-type-detail-meta").textContent = [
-    typePeriodLabel,
-    `${formatTokens(typeUsage.typedThreadCount)}/${formatTokens(typeUsage.threadCount)} threads with typed detail`,
-    `${formatPercent(typeUsage.coverage)} coverage`,
+    periodLabel,
+    `${formatTokens(usage.typedThreadCount)}/${formatTokens(usage.threadCount)} ${threadLabel.toLowerCase()} with typed detail`,
+    `${formatPercent(usage.coverage)} coverage`,
   ].join(" · ");
-  monthDrawer.querySelectorAll("[data-token-type-scope]").forEach((button) => {
-    const selected = button.dataset.tokenTypeScope === activeDrawerTypeScope;
-    button.classList.toggle("is-active", selected);
-    button.setAttribute("aria-pressed", selected ? "true" : "false");
-  });
 
-  document.getElementById("month-daily-bars").innerHTML = renderAxisChart(monthDailyRows, {
-    labelKey: "day",
-    valueKey: "value",
-    emptyText: "No daily data for this month.",
-    height: 240,
-    labelFormatter: (row) => row.day.slice(-2),
-    metaFormatter: (row) => (row.thread_count ? `${formatTokens(row.thread_count)} th` : ""),
-    statusClass: (row) => (row.day === activeDrawerDay ? "is-selected" : ""),
-    tooltipFormatter: (row) =>
-      `${row.day}: ${formatTokens(row.value)} tokens · ${formatTokens(row.thread_count)} threads`,
-    barDataAttrs: (row) => ({ "month-drawer-day": row.day }),
-    barActionLabel: (row) => `Show stats for ${formatDayName(row.day)}`,
-  });
+  const chartRows = drawerChartRows(dailyRows, scope);
+  monthDailyBars.innerHTML = chartRows.length
+    ? renderAxisChart(chartRows, {
+        labelKey: "day",
+        valueKey: "value",
+        emptyText: "No daily data for this scope.",
+        height: 240,
+        labelFormatter: (row) => row.day.slice(-2),
+        metaFormatter: (row) => (row.thread_count ? `${formatTokens(row.thread_count)} th` : ""),
+        statusClass: (row) => (scope.kind === "day" && row.day === scope.day ? "is-selected" : ""),
+        tooltipFormatter: (row) =>
+          `${row.day}: ${formatTokens(row.value)} tokens · ${formatTokens(row.thread_count)} threads`,
+        barDataAttrs: (row) => ({ "month-drawer-day": row.day }),
+        barActionLabel: (row) => `Show stats for ${formatDayName(row.day)}`,
+      })
+    : "";
 
   setHtml(
     "month-machine-list",
-    renderRowList(selectedMachineRows, {
-      emptyText: "No machine data for this day.",
+    renderRowList(machineRows, {
+      emptyText: "No machine data for this scope.",
       title: (row) => row.title,
       value: (row) => row.value,
       meta: (row) => row.meta,
@@ -1165,18 +1277,12 @@ function renderMonthDrawer(month) {
   );
 }
 
-function openMonthDrawer(month, machineHost = null, day = null) {
-  const scopedMachineHost = machineHost || null;
-  if (activeDrawerMonth !== month || activeDrawerMachineHost !== scopedMachineHost) {
-    activeDrawerDay = null;
-  }
-  if (day) {
-    activeDrawerDay = day;
-  }
-  activeDrawerTypeScope = day ? "day" : "month";
-  activeDrawerMonth = month;
-  activeDrawerMachineHost = scopedMachineHost;
-  renderMonthDrawer(month);
+function openActivityDrawer(scope) {
+  activeDrawerScope = {
+    ...scope,
+    machineHost: scope.machineHost || null,
+  };
+  renderActivityDrawer(activeDrawerScope);
   monthDrawer.hidden = false;
   monthDrawerBackdrop.hidden = false;
   monthDrawer.setAttribute("aria-hidden", "false");
@@ -1186,16 +1292,21 @@ function openMonthDrawer(month, machineHost = null, day = null) {
   });
 }
 
+function openMonthDrawer(month, machineHost = null, day = null) {
+  if (day) {
+    openActivityDrawer({ kind: "day", day, startDay: day, endDay: day, machineHost });
+    return;
+  }
+  openActivityDrawer({ kind: "month", month, machineHost });
+}
+
 function closeMonthDrawer() {
-  activeDrawerMonth = null;
-  activeDrawerDay = null;
-  activeDrawerMachineHost = null;
-  activeDrawerTypeScope = "month";
+  activeDrawerScope = null;
   monthDrawer.classList.remove("is-open");
   monthDrawerBackdrop.classList.remove("is-open");
   monthDrawer.setAttribute("aria-hidden", "true");
   window.setTimeout(() => {
-    if (!activeDrawerMonth) {
+    if (!activeDrawerScope) {
       monthDrawer.hidden = true;
       monthDrawerBackdrop.hidden = true;
     }
@@ -1542,8 +1653,8 @@ function renderDashboard(payload) {
   renderRemoteMachines(payload);
   renderMachineMonthlyGrid(payload);
   renderCostPanel(payload);
-  if (activeDrawerMonth) {
-    renderMonthDrawer(activeDrawerMonth);
+  if (activeDrawerScope) {
+    renderActivityDrawer(activeDrawerScope);
   }
 }
 
@@ -1672,23 +1783,38 @@ if (tokenActivity) {
     if (!(event.target instanceof Element)) {
       return;
     }
-    const monthTrigger = event.target.closest("[data-activity-month]");
-    if (monthTrigger) {
-      openMonthDrawer(
-        monthTrigger.dataset.activityMonth,
-        monthTrigger.dataset.activityMachine || null
-      );
-      return;
-    }
-    const trigger = event.target.closest("[data-activity-day]");
+    const trigger = event.target.closest("[data-activity-kind]");
     if (!trigger) {
       return;
     }
-    const day = trigger.dataset.activityDay;
-    if (!day) {
+    const kind = trigger.dataset.activityKind;
+    const machineHost = trigger.dataset.activityMachine || null;
+    if (kind === "month" && trigger.dataset.activityMonth) {
+      openActivityDrawer({ kind, month: trigger.dataset.activityMonth, machineHost });
       return;
     }
-    openMonthDrawer(day.slice(0, 7), trigger.dataset.activityMachine || null, day);
+    if (kind === "week" && trigger.dataset.activityStart && trigger.dataset.activityEnd) {
+      openActivityDrawer({
+        kind,
+        startDay: trigger.dataset.activityStart,
+        endDay: trigger.dataset.activityEnd,
+        machineHost,
+      });
+      return;
+    }
+    const day = trigger.dataset.activityDay;
+    if (kind === "day" && day) {
+      openActivityDrawer({ kind, day, startDay: day, endDay: day, machineHost });
+      return;
+    }
+    if (kind === "cumulative" && trigger.dataset.activityStart && trigger.dataset.activityEnd) {
+      openActivityDrawer({
+        kind,
+        startDay: trigger.dataset.activityStart,
+        endDay: trigger.dataset.activityEnd,
+        machineHost,
+      });
+    }
   });
 }
 
@@ -1719,30 +1845,23 @@ monthDailyBars.addEventListener("click", (event) => {
     return;
   }
   const trigger = event.target.closest("[data-month-drawer-day]");
-  if (!trigger || !activeDrawerMonth) {
+  if (!trigger || !activeDrawerScope) {
     return;
   }
-  activeDrawerDay = trigger.dataset.monthDrawerDay;
-  activeDrawerTypeScope = "day";
-  renderMonthDrawer(activeDrawerMonth);
-});
-
-monthDrawer.addEventListener("click", (event) => {
-  if (!(event.target instanceof Element)) {
-    return;
-  }
-  const trigger = event.target.closest("[data-token-type-scope]");
-  if (!trigger || !activeDrawerMonth) {
-    return;
-  }
-  activeDrawerTypeScope = trigger.dataset.tokenTypeScope === "day" ? "day" : "month";
-  renderMonthDrawer(activeDrawerMonth);
+  const day = trigger.dataset.monthDrawerDay;
+  openActivityDrawer({
+    kind: "day",
+    day,
+    startDay: day,
+    endDay: day,
+    machineHost: activeDrawerScope.machineHost,
+  });
 });
 
 monthDrawerClose.addEventListener("click", closeMonthDrawer);
 monthDrawerBackdrop.addEventListener("click", closeMonthDrawer);
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && activeDrawerMonth) {
+  if (event.key === "Escape" && activeDrawerScope) {
     closeMonthDrawer();
   }
 });

@@ -114,11 +114,11 @@ class TokenTypeTests(unittest.TestCase):
         self.assertIn("cached_input_tokens", script)
         self.assertIn("reasoning_output_tokens", script)
         self.assertIn("mode=ro&immutable=1", script)
-        self.assertIn("accounting_rows(raw_rows)", script)
-        self.assertIn("deduplicated_subagent_count", script)
-        self.assertIn("allocate_daily(counter_events(path), target, fallback_day)", script)
+        self.assertIn("scan_logical_events(paths, metadata)", script)
+        self.assertIn("last_token_usage", script)
+        self.assertIn("replayed_usage_event_count", script)
+        self.assertIn("fingerprint(cumulative)", script)
         self.assertNotIn('grouped(records, "day")', script)
-        self.assertNotIn("datetime.fromisoformat", script)
 
     def test_daily_counter_usage_splits_a_session_by_event_day(self):
         events = [
