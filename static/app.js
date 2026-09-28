@@ -1441,12 +1441,12 @@ function renderBreakdowns(payload) {
 
   setHtml(
     "top-thread-list",
-    renderRowList(source.top_threads, {
+    renderRowList(fleet.top_threads, {
       emptyText: "No heavy threads recorded.",
       title: (row) => row.title_short,
       value: (row) => formatTokens(row.tokens_used),
       meta: (row) =>
-        `${row.cwd_short} · ${row.model} · ${row.reasoning_effort} · ${formatPercent(row.share_pct)} · ${row.updated_local}`,
+        `${row.machine_label} · ${row.cwd_short} · ${row.model} · ${row.reasoning_effort} · ${formatPercent(row.share_pct)} · ${row.updated_local}`,
     })
   );
 

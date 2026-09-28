@@ -10,6 +10,32 @@ import server
 
 
 class RemoteCodexTests(unittest.TestCase):
+    def test_dashboard_snapshot_reuses_fresh_result(self):
+        payload = {"generated_at": "now"}
+        server.DASHBOARD_CACHE_PAYLOAD = None
+        server.DASHBOARD_CACHE_AT = 0.0
+        server.DASHBOARD_REFRESHING = False
+        with mock.patch("server.build_dashboard", return_value=payload) as build:
+            first = server.get_dashboard_snapshot()
+            second = server.get_dashboard_snapshot()
+
+        self.assertIs(first, payload)
+        self.assertIs(second, payload)
+        build.assert_called_once_with()
+        server.DASHBOARD_CACHE_PAYLOAD = None
+        server.DASHBOARD_CACHE_AT = 0.0
+
+    def test_dashboard_snapshot_invalidation_discards_cached_result(self):
+        server.DASHBOARD_CACHE_PAYLOAD = {"generated_at": "old"}
+        server.DASHBOARD_CACHE_AT = 1.0
+        generation = server.DASHBOARD_CACHE_GENERATION
+
+        server.invalidate_dashboard_snapshot()
+
+        self.assertIsNone(server.DASHBOARD_CACHE_PAYLOAD)
+        self.assertEqual(server.DASHBOARD_CACHE_AT, 0.0)
+        self.assertEqual(server.DASHBOARD_CACHE_GENERATION, generation + 1)
+
     def test_remote_query_uses_immutable_read_only_sqlite(self):
         script = server.remote_query_script()
         self.assertIn("mode=ro&immutable=1", script)
@@ -37,6 +63,17 @@ class RemoteCodexTests(unittest.TestCase):
             "daily": [],
             "models": [],
             "cwds": [],
+            "top_threads": [
+                {
+                    "session_id": "remote-thread",
+                    "title": "Remote heavy thread",
+                    "cwd": "/work/remote",
+                    "model": "gpt-test",
+                    "reasoning_effort": "high",
+                    "tokens_used": 75,
+                    "updated_at": 20,
+                }
+            ],
         }
         failure = subprocess.CalledProcessError(1, ["ssh"], stderr="login3 unavailable")
         success = SimpleNamespace(stdout=json.dumps(payload), stderr="", returncode=0)
@@ -53,6 +90,9 @@ class RemoteCodexTests(unittest.TestCase):
         self.assertEqual(result["queried_host"], "login4.example")
         self.assertEqual(result["configured_hosts"], ["login3.example", "login4.example"])
         self.assertEqual(result["total_tokens"], 100)
+        self.assertEqual(result["top_threads"][0]["title_short"], "Remote heavy thread")
+        self.assertEqual(result["top_threads"][0]["machine_label"], "EU03 shared")
+        self.assertEqual(result["top_threads"][0]["share_pct"], 75.0)
 
 
 if __name__ == "__main__":

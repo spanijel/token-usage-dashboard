@@ -118,6 +118,8 @@ class TokenTypeTests(unittest.TestCase):
         self.assertIn("last_token_usage", script)
         self.assertIn("replayed_usage_event_count", script)
         self.assertIn("fingerprint(cumulative)", script)
+        self.assertIn('"top_threads": top_threads', script)
+        self.assertIn("reasoning_effort", script)
         self.assertNotIn('grouped(records, "day")', script)
 
     def test_daily_counter_usage_splits_a_session_by_event_day(self):
@@ -204,13 +206,21 @@ class TokenTypeTests(unittest.TestCase):
             model_months=[{"month": "2026-07", **sol}, {"month": "2026-07", **unknown}],
         )
 
-        self.assertEqual(cost["api_equivalent_cost_total_usd"], 4.4)
-        self.assertEqual(cost["cached_input_cost_usd"], 0.4)
-        self.assertEqual(cost["uncached_input_cost_usd"], 1.0)
-        self.assertEqual(cost["output_cost_usd"], 3.0)
+        self.assertEqual(cost["api_equivalent_cost_total_usd"], 3.12)
+        self.assertEqual(cost["cached_input_cost_usd"], 0.32)
+        self.assertEqual(cost["uncached_input_cost_usd"], 0.8)
+        self.assertEqual(cost["output_cost_usd"], 2.0)
         self.assertEqual(cost["unpriced_tokens"], 100_000)
         self.assertEqual(cost["pricing_coverage_pct"], 91.67)
-        self.assertEqual(cost["latest_month_api_equivalent_cost_usd"], 4.4)
+        self.assertEqual(cost["latest_month_api_equivalent_cost_usd"], 3.12)
+
+    def test_current_gpt6_and_gpt56_standard_rates_are_configured(self):
+        self.assertEqual(server.OFFICIAL_MODEL_PRICING["gpt-6-astra"], (10.00, 1.00, 50.00))
+        self.assertEqual(server.OFFICIAL_MODEL_PRICING["gpt-6-sol"], (2.00, 0.20, 10.00))
+        self.assertEqual(server.OFFICIAL_MODEL_PRICING["gpt-6-luna"], (0.10, 0.01, 0.50))
+        self.assertEqual(server.OFFICIAL_MODEL_PRICING["gpt-5.6-sol"], (4.00, 0.40, 20.00))
+        self.assertEqual(server.OFFICIAL_MODEL_PRICING["gpt-5.6-terra"], (2.00, 0.20, 12.00))
+        self.assertEqual(server.OFFICIAL_MODEL_PRICING["gpt-5.6-luna"], (0.20, 0.02, 1.20))
 
 
 if __name__ == "__main__":

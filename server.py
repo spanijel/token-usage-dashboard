@@ -7,6 +7,8 @@ import re
 import shlex
 import sqlite3
 import subprocess
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -47,9 +49,12 @@ MANUAL_PROVIDERS = {
     "copilot": "GitHub Copilot",
 }
 OFFICIAL_MODEL_PRICING = {
-    "gpt-5.6-sol": (5.00, 0.50, 30.00),
-    "gpt-5.6-terra": (2.50, 0.25, 15.00),
-    "gpt-5.6-luna": (1.00, 0.10, 6.00),
+    "gpt-6-astra": (10.00, 1.00, 50.00),
+    "gpt-6-sol": (2.00, 0.20, 10.00),
+    "gpt-6-luna": (0.10, 0.01, 0.50),
+    "gpt-5.6-sol": (4.00, 0.40, 20.00),
+    "gpt-5.6-terra": (2.00, 0.20, 12.00),
+    "gpt-5.6-luna": (0.20, 0.02, 1.20),
     "gpt-5.5": (5.00, 0.50, 30.00),
     "gpt-5.4": (2.50, 0.25, 15.00),
     "gpt-5.3-codex": (1.75, 0.175, 14.00),
@@ -63,7 +68,7 @@ OFFICIAL_CODEX_PRICING = {
     "kind": "official_api_equivalent",
     "currency": "USD",
     "label": "OpenAI API-equivalent estimate from measured token types",
-    "rates_updated_at": "2026-07-27",
+    "rates_updated_at": "2026-09-28",
     "notes": (
         "Uses official per-model API input, cached-input, and output prices. "
         "This is not a Codex subscription invoice. Long-context uplifts, cache-write charges, "
@@ -82,6 +87,22 @@ REMOTE_CODEX_HOSTS = [
         "label": "EU03 VS Code cluster (shared)",
     },
 ]
+DASHBOARD_CACHE_TTL_SECONDS = 10
+DASHBOARD_CACHE_CONDITION = threading.Condition()
+DASHBOARD_CACHE_PAYLOAD = None
+DASHBOARD_CACHE_AT = 0.0
+DASHBOARD_CACHE_GENERATION = 0
+DASHBOARD_REFRESHING = False
+
+
+def invalidate_dashboard_snapshot():
+    global DASHBOARD_CACHE_AT, DASHBOARD_CACHE_GENERATION, DASHBOARD_CACHE_PAYLOAD
+
+    with DASHBOARD_CACHE_CONDITION:
+        DASHBOARD_CACHE_GENERATION += 1
+        DASHBOARD_CACHE_PAYLOAD = None
+        DASHBOARD_CACHE_AT = 0.0
+        DASHBOARD_CACHE_CONDITION.notify_all()
 
 
 def utc_now() -> str:
@@ -289,6 +310,18 @@ def run_remote_codex_snapshot(host_config):
 
     if payload is not None:
         totals = payload.get("totals") or {}
+        remote_top_threads = []
+        for row in payload.get("top_threads", []):
+            normalized = dict(row)
+            normalized["title_short"] = tidy_title(row.get("title") or row.get("session_id"))
+            normalized["cwd_short"] = abbreviate_path(row.get("cwd"))
+            normalized["updated_local"] = format_local_timestamp(row.get("updated_at"))
+            normalized["share_pct"] = share_pct(
+                row.get("tokens_used", 0), totals.get("total_tokens", 0)
+            )
+            normalized["machine_label"] = label
+            normalized["machine_host"] = display_host
+            remote_top_threads.append(normalized)
         snapshot = {
             "host": display_host,
             "queried_host": queried_host,
@@ -314,6 +347,7 @@ def run_remote_codex_snapshot(host_config):
             "models": payload.get("models", []),
             "model_months": payload.get("model_months", []),
             "cwds": payload.get("cwds", []),
+            "top_threads": remote_top_threads,
             "fetched_at": utc_now(),
         }
         cache_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
@@ -750,7 +784,7 @@ def scan_logical_events_chunk(paths, metadata):
     return events, sessions, raw_count, missing_last
 
 def scan_logical_events(paths, metadata):
-    worker_count = min(4, len(paths))
+    worker_count = min(12, max(1, (len(paths) + 99) // 100), len(paths))
     if worker_count < 2:
         results = [scan_logical_events_chunk(paths, metadata)]
     else:
@@ -790,14 +824,17 @@ con = sqlite3.connect(db_uri, uri=True)
 con.row_factory = sqlite3.Row
 cur = con.cursor()
 raw_rows = [dict(r) for r in cur.execute("""
-SELECT id, source, COALESCE(model, '(unknown)') AS model, cwd,
-       tokens_used, rollout_path, updated_at
+SELECT id, title, source, COALESCE(model, '(unknown)') AS model,
+       COALESCE(reasoning_effort, '(unknown)') AS reasoning_effort,
+       cwd, tokens_used, rollout_path, updated_at
 FROM threads
 """).fetchall()]
 metadata = {
   str(row["id"]): {
     "model": row.get("model") or "(unknown)",
     "cwd": row.get("cwd") or "(unknown)",
+    "title": row.get("title") or str(row["id"]),
+    "reasoning_effort": row.get("reasoning_effort") or "(unknown)",
   }
   for row in raw_rows
 }
@@ -831,6 +868,24 @@ daily = sorted(grouped(daily_records, "day"), key=lambda row: row["day"])
 models = sorted(grouped(records, "model"), key=lambda row: row["total_tokens"], reverse=True)
 cwds = sorted(grouped(records, "cwd"), key=lambda row: row["total_tokens"], reverse=True)[:6]
 model_months = grouped_many(month_records, ("month", "model"))
+session_groups = {}
+for record in records:
+    session_groups.setdefault(record["session_id"], []).append(record)
+top_threads = []
+for session_id, values in session_groups.items():
+    session_meta = metadata.get(session_id) or {}
+    session_usage = aggregate(values)
+    latest = max(values, key=lambda row: row["timestamp"])
+    top_threads.append({
+      "session_id": session_id,
+      "title": session_meta.get("title") or session_id,
+      "cwd": latest.get("cwd") or session_meta.get("cwd") or "(unknown)",
+      "model": latest.get("model") or session_meta.get("model") or "(unknown)",
+      "reasoning_effort": session_meta.get("reasoning_effort") or "(unknown)",
+      "tokens_used": session_usage["total_tokens"],
+      "updated_at": max(value["timestamp"] for value in values),
+    })
+top_threads = sorted(top_threads, key=lambda row: row["tokens_used"], reverse=True)[:12]
 print(json.dumps({
   "status": "configured",
   "db_path": db_path,
@@ -841,6 +896,7 @@ print(json.dumps({
   "models": models,
   "model_months": model_months,
   "cwds": cwds,
+  "top_threads": top_threads,
 }))
 '''
 
@@ -2938,6 +2994,25 @@ def build_dashboard():
     for row in aggregate_workspaces:
         row["avg_tokens"] = round(row["total_tokens"] / row["thread_count"], 0) if row["thread_count"] else 0
         row["share_pct"] = share_pct(row["total_tokens"], combined_total_tokens)
+    fleet_top_threads = [
+        {
+            **row,
+            "machine_label": "Local machine",
+            "machine_host": "local",
+        }
+        for row in codex.get("top_threads", [])
+    ] + [
+        row
+        for source in active_remote_sources
+        for row in source.get("top_threads", [])
+    ]
+    fleet_top_threads = sorted(
+        fleet_top_threads,
+        key=lambda row: row.get("tokens_used", 0) or 0,
+        reverse=True,
+    )[:16]
+    for row in fleet_top_threads:
+        row["share_pct"] = share_pct(row.get("tokens_used", 0), combined_total_tokens)
     machine_breakdown = [
         {
             "label": "Local machine",
@@ -2952,6 +3027,7 @@ def build_dashboard():
             ),
             "monthly": codex.get("monthly", []),
             "daily": codex.get("daily", []),
+            "top_threads": codex.get("top_threads", []),
         }
     ] + [
         {
@@ -2971,6 +3047,7 @@ def build_dashboard():
             ),
             "monthly": source.get("monthly", []),
             "daily": source.get("daily", []),
+            "top_threads": source.get("top_threads", []),
             "cache_notice": source.get("cache_notice"),
             "error": source.get("error"),
         }
@@ -2999,6 +3076,7 @@ def build_dashboard():
         "models": aggregate_models,
         "model_months": combined_model_months,
         "workspaces": aggregate_workspaces,
+        "top_threads": fleet_top_threads,
         "machines": machine_breakdown,
     }
     configured = sum(1 for source in (codex,) if source["status"] == "configured")
@@ -3015,6 +3093,37 @@ def build_dashboard():
         "remote_sources": remote_sources,
         "fleet": fleet,
     }
+
+
+def get_dashboard_snapshot():
+    global DASHBOARD_CACHE_AT, DASHBOARD_CACHE_PAYLOAD, DASHBOARD_REFRESHING
+
+    with DASHBOARD_CACHE_CONDITION:
+        while True:
+            age = time.monotonic() - DASHBOARD_CACHE_AT
+            if DASHBOARD_CACHE_PAYLOAD is not None and age < DASHBOARD_CACHE_TTL_SECONDS:
+                return DASHBOARD_CACHE_PAYLOAD
+            if not DASHBOARD_REFRESHING:
+                DASHBOARD_REFRESHING = True
+                refresh_generation = DASHBOARD_CACHE_GENERATION
+                break
+            DASHBOARD_CACHE_CONDITION.wait()
+
+    try:
+        payload = build_dashboard()
+    except Exception:
+        with DASHBOARD_CACHE_CONDITION:
+            DASHBOARD_REFRESHING = False
+            DASHBOARD_CACHE_CONDITION.notify_all()
+        raise
+
+    with DASHBOARD_CACHE_CONDITION:
+        if refresh_generation == DASHBOARD_CACHE_GENERATION:
+            DASHBOARD_CACHE_PAYLOAD = payload
+            DASHBOARD_CACHE_AT = time.monotonic()
+        DASHBOARD_REFRESHING = False
+        DASHBOARD_CACHE_CONDITION.notify_all()
+        return payload
 
 
 class TokenUsageHandler(BaseHTTPRequestHandler):
@@ -3038,7 +3147,7 @@ class TokenUsageHandler(BaseHTTPRequestHandler):
                 content_type = "image/svg+xml"
             return self.serve_static(name, content_type)
         if route == "/api/dashboard":
-            return json_response(self, build_dashboard())
+            return json_response(self, get_dashboard_snapshot())
         return json_response(
             self,
             {"error": f"Route '{route}' was not found."},
@@ -3055,19 +3164,23 @@ class TokenUsageHandler(BaseHTTPRequestHandler):
                     raise ValueError(f"Unsupported provider '{provider}'.")
                 payload = read_request_json(self)
                 saved = save_manual_source(provider, payload)
+                invalidate_dashboard_snapshot()
                 return json_response(self, {"ok": True, "source": saved})
             if route == "/api/pricing/codex":
                 payload = read_request_json(self)
                 saved = save_codex_pricing(payload)
+                invalidate_dashboard_snapshot()
                 return json_response(self, {"ok": True, "pricing": saved})
             if route.startswith("/api/clear/"):
                 provider = route.rsplit("/", 1)[-1]
                 if provider == "codex-pricing":
                     clear_codex_pricing()
+                    invalidate_dashboard_snapshot()
                     return json_response(self, {"ok": True})
                 if provider not in MANUAL_PROVIDERS:
                     raise ValueError(f"Unsupported provider '{provider}'.")
                 clear_manual_source(provider)
+                invalidate_dashboard_snapshot()
                 return json_response(self, {"ok": True})
         except ValueError as exc:
             return json_response(self, {"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
