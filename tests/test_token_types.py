@@ -214,13 +214,26 @@ class TokenTypeTests(unittest.TestCase):
         self.assertEqual(cost["pricing_coverage_pct"], 91.67)
         self.assertEqual(cost["latest_month_api_equivalent_cost_usd"], 3.12)
 
-    def test_current_gpt6_and_gpt56_standard_rates_are_configured(self):
-        self.assertEqual(server.OFFICIAL_MODEL_PRICING["gpt-6-astra"], (10.00, 1.00, 50.00))
-        self.assertEqual(server.OFFICIAL_MODEL_PRICING["gpt-6-sol"], (2.00, 0.20, 10.00))
-        self.assertEqual(server.OFFICIAL_MODEL_PRICING["gpt-6-luna"], (0.10, 0.01, 0.50))
-        self.assertEqual(server.OFFICIAL_MODEL_PRICING["gpt-5.6-sol"], (4.00, 0.40, 20.00))
-        self.assertEqual(server.OFFICIAL_MODEL_PRICING["gpt-5.6-terra"], (2.00, 0.20, 12.00))
-        self.assertEqual(server.OFFICIAL_MODEL_PRICING["gpt-5.6-luna"], (0.20, 0.02, 1.20))
+    def test_all_configured_gpt_standard_rates_match_reviewed_matrix(self):
+        self.assertEqual(
+            server.OFFICIAL_MODEL_PRICING,
+            {
+                "gpt-6-astra": (10.00, 1.00, 50.00),
+                "gpt-6-sol": (2.00, 0.20, 10.00),
+                "gpt-6-luna": (0.10, 0.01, 0.50),
+                "gpt-5.6-sol": (4.00, 0.40, 20.00),
+                "gpt-5.6-terra": (2.00, 0.20, 12.00),
+                "gpt-5.6-luna": (0.20, 0.02, 1.20),
+                "gpt-5.5": (5.00, 0.50, 30.00),
+                "gpt-5.4": (2.50, 0.25, 15.00),
+                "gpt-5.3-codex": (1.75, 0.175, 14.00),
+                "gpt-5.2-codex": (1.75, 0.175, 14.00),
+                "gpt-5.1-codex-max": (1.25, 0.125, 10.00),
+                "gpt-5.1-codex": (1.25, 0.125, 10.00),
+                "gpt-5.1-codex-mini": (0.25, 0.025, 2.00),
+                "gpt-5-codex": (1.25, 0.125, 10.00),
+            },
+        )
 
 
 if __name__ == "__main__":
